@@ -139,6 +139,13 @@ struct mx_store {
     int64_t fsyncs;            /* number of journal fsyncs */
     int64_t writes;            /* number of journal write batches */
     int64_t max_batch;         /* most changes made durable by one fsync */
+    char *journal_old_path;    /* journal rotated away by a running background compaction */
+    pid_t compact_pid;         /* background compaction child (0 = none) */
+    int64_t compact_started;
+    int sync_compaction;       /* 1 = compact in-process (blocks the loop), 0 = fork (default) */
+    int test_crash_compaction; /* testing: the compaction child dies halfway through the snapshot */
+    int64_t compactions, compact_failures;
+    int64_t last_compact_block_ms; /* how long the last compaction blocked the caller */
     int fault_syncs;           /* testing: the next N syncs fail like an fsync error would */
     sbuf pending;              /* group commit: records not written yet */
     int64_t pending_records;
@@ -181,8 +188,16 @@ int mx_store_commit_cb(void *st);
 /* 1 when changes were committed that are not durable yet. */
 int mx_store_dirty(const mx_store *st);
 
-/* Write the snapshot (tmp + fsync + rename) and truncate the journal. */
+/* Write the snapshot (tmp + fsync + rename) and truncate the journal, in
+ * this process (blocks until done). Waits for a running background one first. */
 int mx_store_compact(mx_store *st);
+/* Background compaction: rotate journal.log to journal.old (fresh journal
+ * for new records), fork, and let the child write the snapshot from its
+ * copy-on-write image; mx_store_tick reaps it and drops journal.old. The
+ * parent is blocked only for the rotation and fork(). A crash anywhere in
+ * between loses nothing: open replays snapshot + journal.old + journal.log
+ * and merges them. Returns 0 (started), 1 (one is already running), -1. */
+int mx_store_compact_bg(mx_store *st);
 
 /* Calls fn for every durable retained public change with seq > since that
  * keep(scope) accepts (keep NULL = all). Returns 0, or -1 when since is
@@ -194,7 +209,8 @@ int mx_store_for_each_since(const mx_store *st, int64_t since, mx_change_filter 
 /* i-th retained change, oldest first (i < ring_len). */
 const mx_change *mx_store_ring_at(const mx_store *st, size_t i);
 
-/* Event loop housekeeping (reaps a background compaction). Cheap. */
+/* Event loop housekeeping (reaps a background compaction). Cheap; call it
+ * from the server tick. */
 void mx_store_tick(mx_store *st);
 
 #endif

@@ -138,6 +138,26 @@ try {
     if (nd) await api('DELETE', `/api/todos/${nd.id}`);
   }
 
+  section('background compaction survives kill -9');
+  {
+    const rs = await Promise.all(Array.from({ length: 300 }, (_, i) => api('POST', '/api/todos', { title: `bg ${i}`, list: 'bg' })));
+    check(rs.every((r) => r.status === 201), '300 created');
+    const c = await api('POST', '/api/compact?bg=1');
+    check(c.json?.ok === true, 'background compaction started', c.json);
+    const more = await api('POST', '/api/todos', { title: 'after rotate', list: 'bg' });
+    check(more.status === 201, 'writes continue during compaction');
+    proc.kill('SIGKILL');
+    await new Promise((r) => proc.once('exit', r));
+    await start();
+    const bg = (await api('GET', '/api/todos?list=bg&limit=1000')).json;
+    check(bg.length === 301, 'nothing lost', bg.length);
+    let st = (await api('GET', '/api/stats')).json;
+    const c2 = await api('POST', '/api/compact?bg=1');
+    for (let i = 0; i < 100 && st.compactions < 1; i++) { await sleep(50); st = (await api('GET', '/api/stats')).json; }
+    check(c2.json?.ok && st.compactions >= 1, 'background compaction completes', st);
+    for (const r of [...rs, more]) await api('DELETE', `/api/todos/${r.json.id}`);
+  }
+
   section('persistence');
   const before = (await api('GET', '/api/todos')).json;
   await stop();

@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <stdlib.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "modx/store.h"
@@ -387,6 +388,90 @@ static void t_flags_hooks(void) {
     rm_rf(dir);
 }
 
+static void fill(mx_store *st, int from, int to) {
+    char id[16];
+    for (int i = from; i < to; i++) {
+        snprintf(id, sizeof id, "c%05d", i);
+        mx_store_put(st, T_ITEMS, item(id, i), NULL);
+    }
+    mx_store_sync(st);
+}
+
+static void wait_bg(mx_store *st) {
+    for (int i = 0; i < 2000 && st->compact_pid > 0; i++) { mx_store_tick(st); usleep(5000); }
+}
+
+static void t_background_compaction(void) {
+    char *dir = make_tmpdir();
+    char *jp = file_path(dir, "journal.log"), *op = file_path(dir, "journal.old"), *sp = file_path(dir, "snapshot.json");
+    mx_store *st = open_st(dir, 100);
+    fill(st, 0, 3000);
+    CHECK(mx_store_compact_bg(st) == 0 && st->compact_pid > 0);
+    CHECK(mx_store_compact_bg(st) == 1);      /* one at a time */
+    CHECK(file_size(jp) == 0 && file_size(op) > 0);
+    fill(st, 3000, 3100);                      /* the journal keeps going meanwhile */
+    mx_store_del(st, T_ITEMS, "c00007", NULL);
+    mx_store_sync(st);
+    wait_bg(st);
+    CHECK(st->compact_pid == 0 && st->compactions == 1 && st->compact_failures == 0);
+    CHECK(file_size(op) == -1 && file_size(sp) > 0 && file_size(jp) > 0);
+    mx_store_close(st);
+    st = open_st(dir, 100);
+    CHECK(st && mx_store_count(st, T_ITEMS) == 3099 && !mx_store_get(st, T_ITEMS, "c00007"));
+    CHECK(st && st->seq == 3101 && st->recovered_truncated == 0);
+    mx_store_close(st);
+
+    /* the child dies halfway through writing the snapshot */
+    st = open_st(dir, 100);
+    long snap_before = file_size(sp);
+    fill(st, 4000, 4500);
+    st->test_crash_compaction = 1;
+    CHECK(mx_store_compact_bg(st) == 0);
+    fill(st, 4500, 4600);
+    wait_bg(st);
+    CHECK(st->compact_failures == 1 && file_size(op) > 0); /* rotated journal kept */
+    CHECK(file_size(sp) == snap_before);                    /* old snapshot untouched */
+    mx_store_close(st);
+    st = open_st(dir, 100);
+    CHECK(st && mx_store_count(st, T_ITEMS) == 3099 + 600 && st->seq == 3101 + 600);
+    CHECK(file_size(op) == -1); /* merged on open */
+    /* after a failure the next compaction is a synchronous one that covers journal.old */
+    mx_store_close(st);
+
+    /* the parent dies after the child finished, before it dropped journal.old */
+    st = open_st(dir, 100);
+    fill(st, 5000, 5200);
+    CHECK(mx_store_compact_bg(st) == 0);
+    fill(st, 5200, 5250);
+    int status;
+    waitpid(st->compact_pid, &status, 0);      /* child done, parent never reaps: "crash" */
+    st->compact_pid = 0;
+    CHECK(file_size(op) > 0);
+    mx_store *st2 = open_st(dir, 100);
+    CHECK(st2 && mx_store_count(st2, T_ITEMS) == 3699 + 250 && st2->seq == 3701 + 250);
+    CHECK(file_size(op) == -1);
+    mx_store_close(st2);
+    close(st->journal_fd); /* the "crashed" one writes nothing more */
+    st->journal_fd = -1;
+    mx_store_close(st);
+
+    /* threshold-triggered compaction runs in the background */
+    st = open_st(dir, 100);
+    st->compact_threshold = 4096;
+    fill(st, 6000, 6100);
+    CHECK(st->compact_pid > 0 || st->compactions > 0);
+    wait_bg(st);
+    CHECK(st->compactions >= 1 && file_size(op) == -1);
+    mx_store_close(st);
+    st = open_st(dir, 100);
+    CHECK(st && mx_store_count(st, T_ITEMS) == 3949 + 100);
+    mx_store_close(st);
+    free(jp);
+    free(op);
+    free(sp);
+    rm_rf(dir);
+}
+
 void test_store_all(void) {
     RUN(t_hmap);
     RUN(t_append_reload);
@@ -395,4 +480,5 @@ void test_store_all(void) {
     RUN(t_compaction);
     RUN(t_ring_window);
     RUN(t_flags_hooks);
+    RUN(t_background_compaction);
 }

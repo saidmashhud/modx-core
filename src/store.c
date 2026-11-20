@@ -5,7 +5,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 /* ---------------- hash map ---------------- */
@@ -166,6 +168,7 @@ static int fsync_dir(const char *dir) {
 }
 
 static int flush_pending(mx_store *st);
+static void compact_done(mx_store *st, int status);
 
 /* ---------------- ring ---------------- */
 
@@ -421,6 +424,11 @@ mx_store *mx_store_open(const char *dir, const mx_coll_def *defs, int ncoll, siz
 
     if (load_snapshot(st, err, errlen) != 0) { mx_store_close(st); return NULL; }
     int64_t snap_seq = st->seq;
+    /* a background compaction was interrupted: its rotated journal holds the
+     * records between the old snapshot and the current journal */
+    st->journal_old_path = path_join(dir, "journal.old");
+    int had_old = access(st->journal_old_path, F_OK) == 0;
+    if (had_old && replay_file(st, st->journal_old_path, snap_seq, 0, err, errlen) < 0) { mx_store_close(st); return NULL; }
     int64_t good = replay_file(st, st->journal_path, snap_seq, 1, err, errlen);
     if (good < 0) { mx_store_close(st); return NULL; }
     st->journal_size = good;
@@ -432,12 +440,22 @@ mx_store *mx_store_open(const char *dir, const mx_coll_def *defs, int ncoll, siz
     }
     if (st->recovered_truncated) fsync(st->journal_fd);
     st->synced_seq = st->seq;
+    if (had_old && mx_store_compact(st) != 0) {
+        snprintf(err, errlen, "cannot merge %s into a new snapshot", st->journal_old_path);
+        mx_store_close(st);
+        return NULL;
+    }
     st->open_ms = mono_ms() - t0;
     return st;
 }
 
 void mx_store_close(mx_store *st) {
     if (!st) return;
+    if (st->compact_pid > 0) {
+        int status;
+        while (waitpid(st->compact_pid, &status, 0) < 0 && errno == EINTR) {}
+        compact_done(st, status);
+    }
     if (st->journal_fd >= 0) {
         flush_pending(st);
         fsync(st->journal_fd);
@@ -450,6 +468,7 @@ void mx_store_close(mx_store *st) {
     free(st->dir);
     free(st->journal_path);
     free(st->snapshot_path);
+    free(st->journal_old_path);
     sbuf_free(&st->pending);
     free(st);
 }
@@ -585,8 +604,9 @@ int mx_store_sync(mx_store *st) {
             if (e->seq > from && e->json) st->listener(st->listener_ctx, e);
         }
     }
-    if (st->journal_size > st->compact_threshold) {
-        if (mx_store_compact(st) != 0) fprintf(stderr, "modx: compaction failed (journal kept)\n");
+    if (st->journal_size > st->compact_threshold && st->compact_pid <= 0) {
+        int rc = st->sync_compaction ? mx_store_compact(st) : mx_store_compact_bg(st);
+        if (rc < 0) fprintf(stderr, "modx: compaction failed (journal kept)\n");
     }
     return 0;
 }
@@ -594,7 +614,13 @@ int mx_store_sync(mx_store *st) {
 int mx_store_pending_cb(void *st) { return mx_store_dirty(st); }
 int mx_store_commit_cb(void *st) { return mx_store_sync(st); }
 
-void mx_store_tick(mx_store *st) { (void)st; }
+void mx_store_tick(mx_store *st) {
+    if (st->compact_pid <= 0) return;
+    int status;
+    pid_t r = waitpid(st->compact_pid, &status, WNOHANG);
+    if (r == st->compact_pid) compact_done(st, status);
+    else if (r < 0 && errno != EINTR) { st->compact_pid = 0; st->compact_failures++; }
+}
 
 /* ---------------- snapshot ---------------- */
 
@@ -623,8 +649,86 @@ static void serialize_snapshot(const mx_store *st, sbuf *out) {
     sbuf_puts(out, "}}\n");
 }
 
+/* Writes buf as the snapshot: tmp file, fsync, rename, fsync dir. */
+static int write_snapshot_file(const mx_store *st, const sbuf *out, int crash_test) {
+    char *tmp = path_join(st->dir, "snapshot.json.tmp");
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    int rc = -1;
+    if (fd >= 0) {
+        if (crash_test) {
+            /* tests: die halfway through the file, like a power cut would */
+            if (write_all(fd, out->data, out->len / 2) == 0) fsync(fd);
+            raise(SIGKILL);
+        }
+        if (write_all(fd, out->data, out->len) == 0 && fsync(fd) == 0) rc = 0;
+        close(fd);
+    }
+    if (rc == 0 && rename(tmp, st->snapshot_path) != 0) rc = -1;
+    if (rc != 0) unlink(tmp);
+    else fsync_dir(st->dir);
+    free(tmp);
+    return rc;
+}
+
+static void compact_done(mx_store *st, int status) {
+    st->compact_pid = 0;
+    st->last_compact_ms = mono_ms() - st->compact_started;
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        /* the new snapshot covers the rotated journal */
+        if (unlink(st->journal_old_path) == 0) fsync_dir(st->dir);
+        st->compactions++;
+    } else {
+        /* journal.old stays: the next compaction is a synchronous one that covers it */
+        fprintf(stderr, "modx: background snapshot failed (status %d); journal kept\n", status);
+        st->compact_failures++;
+    }
+}
+
+int mx_store_compact_bg(mx_store *st) {
+    if (st->compact_pid > 0) return 1;
+    /* a previous background run failed: its rotated journal must be covered first */
+    if (access(st->journal_old_path, F_OK) == 0) return mx_store_compact(st);
+    int64_t t0 = mono_ms();
+    if (flush_pending(st) != 0 || fsync(st->journal_fd) != 0) return -1;
+    if (st->hooks.before_snapshot) st->hooks.before_snapshot(st->hooks.ctx, st);
+    /* rotate: journal.log -> journal.old (records <= seq), fresh journal.log for what follows */
+    if (rename(st->journal_path, st->journal_old_path) != 0) return -1;
+    int nfd = open(st->journal_path, O_WRONLY | O_CREAT | O_APPEND | O_TRUNC, 0644);
+    if (nfd < 0) {
+        int e = errno;
+        if (rename(st->journal_old_path, st->journal_path) != 0) { /* still readable as journal.old */ }
+        errno = e;
+        return -1;
+    }
+    fsync_dir(st->dir);
+    close(st->journal_fd);
+    st->journal_fd = nfd;
+    st->journal_size = 0;
+    pid_t pid = fork();
+    if (pid < 0) {
+        /* no child: do it here; the rotated journal is covered by the snapshot */
+        return mx_store_compact(st);
+    }
+    if (pid == 0) {
+        /* child: memory is a copy-on-write image of the store at seq */
+        sbuf out;
+        sbuf_init(&out);
+        serialize_snapshot(st, &out);
+        _exit(write_snapshot_file(st, &out, st->test_crash_compaction) == 0 ? 0 : 1);
+    }
+    st->compact_pid = pid;
+    st->compact_started = t0;
+    st->last_compact_block_ms = mono_ms() - t0;
+    return 0;
+}
+
 int mx_store_compact(mx_store *st) {
     int64_t t0 = mono_ms();
+    if (st->compact_pid > 0) {
+        int status;
+        while (waitpid(st->compact_pid, &status, 0) < 0 && errno == EINTR) {}
+        compact_done(st, status);
+    }
     /* records not written yet would be lost by the truncate below: they are in
      * memory (and so in the snapshot), but write them anyway so a failed
      * snapshot leaves the journal complete */
@@ -633,30 +737,21 @@ int mx_store_compact(mx_store *st) {
     sbuf out;
     sbuf_init(&out);
     serialize_snapshot(st, &out);
-    char *tmp = path_join(st->dir, "snapshot.json.tmp");
-    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    int rc = -1;
-    if (fd >= 0) {
-        if (write_all(fd, out.data, out.len) == 0 && fsync(fd) == 0) rc = 0;
-        close(fd);
-    }
+    int rc = write_snapshot_file(st, &out, 0);
     sbuf_free(&out);
-    if (rc == 0 && rename(tmp, st->snapshot_path) != 0) rc = -1;
     if (rc != 0) {
         fprintf(stderr, "modx: snapshot write failed: %s\n", strerror(errno));
-        unlink(tmp);
-        free(tmp);
         return -1;
     }
-    free(tmp);
-    fsync_dir(st->dir);
     /* the snapshot now covers every journal record; drop them */
+    if (unlink(st->journal_old_path) == 0) fsync_dir(st->dir);
     if (ftruncate(st->journal_fd, 0) != 0 || fsync(st->journal_fd) != 0) {
         fprintf(stderr, "modx: journal truncate failed: %s\n", strerror(errno));
         return -1; /* harmless: records <= snapshot seq are skipped on replay */
     }
     st->journal_size = 0;
-    st->last_compact_ms = mono_ms() - t0;
+    st->last_compact_ms = st->last_compact_block_ms = mono_ms() - t0;
+    st->compactions++;
     return 0;
 }
 

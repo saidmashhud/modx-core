@@ -96,11 +96,12 @@ try {
     const lg = loadgen(['--mode', 'get', '--conns', '16', '--duration', String(Math.max(3, P.dur / 2)), '--rows', String(P.rows)]);
     await sleep(1000);
     const t0 = performance.now();
-    const c = await (await fetch(base + '/api/compact', { method: 'POST' })).json();
+    const before = await stats();
+    const c = await (await fetch(base + `/api/compact${args.sync ? '' : '?bg=1'}`, { method: 'POST' })).json();
     const reqMs = Math.round(performance.now() - t0);
     const reads = await lg;
-    await sleep(500);
-    const st = await stats();
+    let st = await stats();
+    for (let i = 0; i < 600 && (st.compacting || st.compactions === before.compactions); i++) { await sleep(100); st = await stats(); }
     results.scenarios.compact = { rows: P.rows, request_ms: reqMs, blocked_ms: c.blocked_ms, last_compact_ms: st.last_compact_ms, reads_p50_ms: reads.p50_ms, reads_p99_ms: reads.p99_ms, reads_max_ms: reads.max_ms, reads_rps: reads.rps };
     console.error(`  compact: blocked ${c.blocked_ms} ms, reads max ${reads.max_ms} ms`);
   }
@@ -130,6 +131,6 @@ for (const m of ['get', 'list', 'write', 'mixed']) if (S[m]) lines.push(`| ${m} 
 if (S.sse) lines.push(`| sse ${S.sse.subs} subs × ${S.sse.writes} writes (delivery) | ${S.sse.events_per_s} ev/s | ${S.sse.deliver_p50_ms} | ${S.sse.deliver_p95_ms} | ${S.sse.deliver_p99_ms} | ${(S.sse.rss_kb / 1024).toFixed(1)} |`);
 lines.push('');
 if (S.startup) lines.push(`- startup from snapshot (${S.startup.rows} rows): open ${S.startup.open_ms} ms, RSS ${(S.startup.rss_kb / 1024).toFixed(1)} MiB`);
-if (S.compact) lines.push(`- compaction of ${S.compact.rows} rows: event loop blocked ${S.compact.blocked_ms} ms; concurrent reads p99 ${S.compact.reads_p99_ms} ms, max ${S.compact.reads_max_ms} ms`);
+if (S.compact) lines.push(`- compaction of ${S.compact.rows} rows: event loop blocked ${S.compact.blocked_ms} ms, snapshot done in ${S.compact.last_compact_ms} ms; concurrent reads p99 ${S.compact.reads_p99_ms} ms, max ${S.compact.reads_max_ms} ms`);
 if (S.recovery) lines.push(`- recovery: snapshot + ${S.recovery.journal_records} journal records (${(S.recovery.journal_bytes / 2 ** 20).toFixed(1)} MiB) replayed in ${S.recovery.open_ms} ms`);
 console.log(lines.join('\n'));

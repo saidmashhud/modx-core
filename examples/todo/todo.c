@@ -9,7 +9,7 @@
  *   GET    /api/changes?since=<seq>                     -> [change, ...] or 410
  *   GET    /api/events                                  -> SSE (Last-Event-ID catch-up)
  *   GET    /api/stats                                   -> counters (bench)
- *   POST   /api/compact                                 -> compact now (TODO_ADMIN=1)
+ *   POST   /api/compact[?bg=1]                          -> compact now / in the background (TODO_ADMIN=1)
  *   POST   /api/fault                                   -> fail the next commit (TODO_ADMIN=1, tests)
  *   anything else: static files from TODO_STATIC (default examples/todo/public)
  *
@@ -186,18 +186,20 @@ static void handle(http_server *srv, http_conn *c, const http_request *req, http
         resp->content_type = "application/json; charset=utf-8";
         sbuf_printf(&resp->body,
                     "{\"seq\":%lld,\"rows\":%zu,\"journal_bytes\":%lld,\"open_ms\":%lld,\"last_compact_ms\":%lld,"
-                    "\"fsyncs\":%lld,\"max_batch\":%lld,\"conns\":%zu,\"peak_conns\":%zu,\"streams\":%zu,\"max_rss_kb\":%ld}",
+                    "\"compactions\":%lld,\"compacting\":%s,\"fsyncs\":%lld,\"max_batch\":%lld,\"conns\":%zu,\"peak_conns\":%zu,\"streams\":%zu,\"max_rss_kb\":%ld}",
                     (long long)a->st->seq, mx_store_count(a->st, C_TODOS), (long long)a->st->journal_size,
-                    (long long)a->st->open_ms, (long long)a->st->last_compact_ms, (long long)a->st->fsyncs, (long long)a->st->max_batch,
+                    (long long)a->st->open_ms, (long long)a->st->last_compact_ms, (long long)a->st->compactions,
+                    a->st->compact_pid > 0 ? "true" : "false", (long long)a->st->fsyncs, (long long)a->st->max_batch,
                     srv->nconns, srv->nconns_peak, mx_sse_count(&a->sse), rss_kb());
         return;
     }
     if (strcmp(p, "/api/compact") == 0 && strcmp(m, "POST") == 0) {
         if (!a->admin) { reply_err(resp, 403, "forbidden"); return; }
         int64_t t0 = mono_ms();
-        int rc = mx_store_compact(a->st);
+        const char *bg = http_req_query(req, "bg");
+        int rc = bg && strcmp(bg, "1") == 0 ? mx_store_compact_bg(a->st) : mx_store_compact(a->st);
         resp->content_type = "application/json; charset=utf-8";
-        sbuf_printf(&resp->body, "{\"ok\":%s,\"blocked_ms\":%lld}", rc == 0 ? "true" : "false",
+        sbuf_printf(&resp->body, "{\"ok\":%s,\"blocked_ms\":%lld}", rc >= 0 ? "true" : "false",
                     (long long)(mono_ms() - t0));
         return;
     }
