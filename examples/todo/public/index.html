@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>modx-core todo</title>
+<style>
+  body { font: 15px/1.5 system-ui, sans-serif; max-width: 36rem; margin: 2rem auto; padding: 0 1rem; }
+  li { list-style: none; padding: .25rem 0; }
+  li.done span { text-decoration: line-through; opacity: .6; }
+</style>
+<h1>Todo</h1>
+<form id="f"><input id="t" placeholder="What needs doing?" autofocus> <button>Add</button></form>
+<ul id="l"></ul>
+<p><small>Plain page served by examples/todo. Changes from other tabs arrive over SSE.</small></p>
+<script type="module">
+const rows = new Map();
+const ul = document.getElementById('l');
+function render() {
+  ul.replaceChildren(...[...rows.values()].sort((a, b) => b.updated_at - a.updated_at).map((r) => {
+    const li = document.createElement('li');
+    li.className = r.done ? 'done' : '';
+    const cb = Object.assign(document.createElement('input'), { type: 'checkbox', checked: r.done });
+    cb.onchange = () => fetch(`/api/todos/${r.id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ done: cb.checked }) });
+    const span = Object.assign(document.createElement('span'), { textContent: ' ' + r.title });
+    li.append(cb, span);
+    return li;
+  }));
+}
+for (const r of await (await fetch('/api/todos?limit=200')).json()) rows.set(r.id, r);
+render();
+new EventSource('/api/events').onmessage = (e) => {
+  const ch = JSON.parse(e.data);
+  if (ch.op === 'put') rows.set(ch.id, ch.data); else rows.delete(ch.id);
+  render();
+};
+document.getElementById('f').onsubmit = async (e) => {
+  e.preventDefault();
+  const t = document.getElementById('t');
+  if (!t.value.trim()) return;
+  await fetch('/api/todos', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: t.value }) });
+  t.value = '';
+};
+</script>
+</html>
