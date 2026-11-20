@@ -1,0 +1,131 @@
+{
+  "label": "2-group-commit",
+  "profile": "full",
+  "params": {
+    "rows": 100000,
+    "dur": 8,
+    "conns": 64,
+    "subs": 1000,
+    "writes": 200,
+    "pause": 3000,
+    "fill": 8
+  },
+  "hardware": {
+    "cpu": "Apple M1 Pro",
+    "cores": 10,
+    "mem_gib": 16,
+    "os": "darwin 27.2.0",
+    "disk": "File System Personality: APFS; Protocol: Apple Fabric; Solid State: Yes",
+    "node": "v22.23.1"
+  },
+  "date": "2026-11-20T22:05:23.934Z",
+  "scenarios": {
+    "seed": {
+      "rows": 100000,
+      "wall_ms": 426
+    },
+    "startup": {
+      "rows": 100000,
+      "wall_ms": 97,
+      "open_ms": 91,
+      "startup_ms": 91,
+      "rss_kb": 106928
+    },
+    "get": {
+      "code": 0,
+      "mode": "get",
+      "conns": 64,
+      "duration_s": 8,
+      "requests": 716227,
+      "errors": 0,
+      "non2xx": 0,
+      "rps": 89524,
+      "p50_ms": 0.626,
+      "p95_ms": 0.979,
+      "p99_ms": 1.176,
+      "max_ms": 5.381,
+      "rss_kb": 86848
+    },
+    "list": {
+      "code": 0,
+      "mode": "list",
+      "conns": 64,
+      "duration_s": 8.17,
+      "requests": 968,
+      "errors": 0,
+      "non2xx": 0,
+      "rps": 118,
+      "p50_ms": 521.399,
+      "p95_ms": 642.754,
+      "p99_ms": 645.028,
+      "max_ms": 645.096,
+      "rss_kb": 91408
+    },
+    "write": {
+      "code": 0,
+      "mode": "write",
+      "conns": 64,
+      "duration_s": 8,
+      "requests": 382775,
+      "errors": 0,
+      "non2xx": 0,
+      "rps": 47844,
+      "p50_ms": 0.8,
+      "p95_ms": 1.335,
+      "p99_ms": 1.939,
+      "max_ms": 161.798,
+      "rss_kb": 247008
+    },
+    "mixed": {
+      "code": 0,
+      "mode": "mixed",
+      "conns": 64,
+      "duration_s": 8.03,
+      "requests": 7307,
+      "errors": 0,
+      "non2xx": 0,
+      "rps": 909,
+      "p50_ms": 69.997,
+      "p95_ms": 134.01,
+      "p99_ms": 148.517,
+      "max_ms": 150.78,
+      "rss_kb": 112240
+    },
+    "sse": {
+      "code": 0,
+      "mode": "sse",
+      "subs": 1000,
+      "writes": 200,
+      "open_ms": 64.3,
+      "expected": 200000,
+      "delivered": 200000,
+      "elapsed_s": 1.37,
+      "events_per_s": 145830,
+      "deliver_p50_ms": 5,
+      "deliver_p95_ms": 7.979,
+      "deliver_p99_ms": 9.113,
+      "write_p50_ms": 2.958,
+      "write_p99_ms": 5.158,
+      "rss_kb": 126016
+    },
+    "compact": {
+      "rows": 100000,
+      "request_ms": 215,
+      "blocked_ms": 169,
+      "last_compact_ms": 169,
+      "reads_p50_ms": 0.141,
+      "reads_p99_ms": 0.298,
+      "reads_max_ms": 170.289,
+      "reads_rps": 90871
+    },
+    "recovery": {
+      "rows": 100000,
+      "journal_records": 384433,
+      "journal_bytes": 82610301,
+      "wall_ms": 2126,
+      "open_ms": 2118,
+      "startup_ms": 2119,
+      "rss_kb": 194816
+    }
+  }
+}

@@ -165,6 +165,8 @@ static int fsync_dir(const char *dir) {
     return rc;
 }
 
+static int flush_pending(mx_store *st);
+
 /* ---------------- ring ---------------- */
 
 static void change_free(mx_store *st, mx_change *e) {
@@ -437,6 +439,7 @@ mx_store *mx_store_open(const char *dir, const mx_coll_def *defs, int ncoll, siz
 void mx_store_close(mx_store *st) {
     if (!st) return;
     if (st->journal_fd >= 0) {
+        flush_pending(st);
         fsync(st->journal_fd);
         close(st->journal_fd);
     }
@@ -447,6 +450,7 @@ void mx_store_close(mx_store *st) {
     free(st->dir);
     free(st->journal_path);
     free(st->snapshot_path);
+    sbuf_free(&st->pending);
     free(st);
 }
 
@@ -488,23 +492,12 @@ static int commit(mx_store *st, int coll, const char *op, const char *id, const 
     int had_extra = 0;
     write_change(st, &ch, seq, coll, op, id, key, data, client_id, ts, 0, &had_extra);
 
-    sbuf line;
-    sbuf_init(&line);
-    sbuf_printf(&line, "%08x ", crc32_buf(ch.data, ch.len));
-    sbuf_put(&line, ch.data, ch.len);
-    sbuf_putc(&line, '\n');
-    if (write_all(st->journal_fd, line.data, line.len) != 0) {
-        fprintf(stderr, "modx: journal write failed: %s\n", strerror(errno));
-        /* drop a partially written record so later appends stay parseable */
-        if (ftruncate(st->journal_fd, (off_t)st->journal_size) != 0) { /* recovery handles it */ }
-        sbuf_free(&line);
-        sbuf_free(&ch);
-        json_free(data);
-        free(key);
-        return -1;
-    }
-    st->journal_size += (int64_t)line.len;
-    sbuf_free(&line);
+    /* group commit: records collect in memory; mx_store_sync writes them with
+     * one write() and one fsync() */
+    sbuf_printf(&st->pending, "%08x ", crc32_buf(ch.data, ch.len));
+    sbuf_put(&st->pending, ch.data, ch.len);
+    sbuf_putc(&st->pending, '\n');
+    st->pending_records++;
     st->seq = seq;
 
     char *pub = NULL;
@@ -550,13 +543,40 @@ int mx_store_del(mx_store *st, int coll, const char *id, const char *client_id) 
 
 int mx_store_dirty(const mx_store *st) { return st->synced_seq != st->seq; }
 
+/* Write the pending records (one write). On failure the partial tail is cut
+ * so later appends stay parseable. */
+static int flush_pending(mx_store *st) {
+    if (!st->pending.len) return 0;
+    if (write_all(st->journal_fd, st->pending.data, st->pending.len) != 0) {
+        fprintf(stderr, "modx: journal write failed: %s\n", strerror(errno));
+        if (ftruncate(st->journal_fd, (off_t)st->journal_size) != 0) { /* recovery cuts it */ }
+        st->pending.len = 0;
+        st->pending_records = 0;
+        return -1;
+    }
+    st->journal_size += (int64_t)st->pending.len;
+    st->writes++;
+    st->pending.len = 0;
+    st->pending_records = 0;
+    if (st->pending.cap > (1u << 20)) sbuf_free(&st->pending);
+    return 0;
+}
+
 int mx_store_sync(mx_store *st) {
     if (st->synced_seq == st->seq) return 0;
+    int64_t batch = st->seq - st->synced_seq;
+    if (st->fault_syncs > 0) {
+        st->fault_syncs--;
+        fprintf(stderr, "modx: journal fsync failed: injected fault\n");
+        return -1;
+    }
+    if (flush_pending(st) != 0) return -1;
     if (fsync(st->journal_fd) != 0) {
         fprintf(stderr, "modx: journal fsync failed: %s\n", strerror(errno));
         return -1;
     }
     st->fsyncs++;
+    if (batch > st->max_batch) st->max_batch = batch;
     int64_t from = st->synced_seq;
     st->synced_seq = st->seq;
     if (st->listener) {
@@ -570,6 +590,9 @@ int mx_store_sync(mx_store *st) {
     }
     return 0;
 }
+
+int mx_store_pending_cb(void *st) { return mx_store_dirty(st); }
+int mx_store_commit_cb(void *st) { return mx_store_sync(st); }
 
 void mx_store_tick(mx_store *st) { (void)st; }
 
@@ -602,6 +625,10 @@ static void serialize_snapshot(const mx_store *st, sbuf *out) {
 
 int mx_store_compact(mx_store *st) {
     int64_t t0 = mono_ms();
+    /* records not written yet would be lost by the truncate below: they are in
+     * memory (and so in the snapshot), but write them anyway so a failed
+     * snapshot leaves the journal complete */
+    if (flush_pending(st) != 0) return -1;
     if (st->hooks.before_snapshot) st->hooks.before_snapshot(st->hooks.ctx, st);
     sbuf out;
     sbuf_init(&out);

@@ -113,6 +113,31 @@ try {
   check(ch.status === 200 && ch.json.length === 3, '/changes since 1', ch.json);
   check((await api('GET', '/api/changes?since=99')).status === 410, '/changes 410');
 
+  section('group commit: acknowledged means durable');
+  {
+    const st0 = (await api('GET', '/api/stats')).json;
+    const rs = await Promise.all(Array.from({ length: 200 }, (_, i) => api('POST', '/api/todos', { title: `gc ${i}`, list: 'gc' })));
+    check(rs.every((r) => r.status === 201), 'all 200 created');
+    const st1 = (await api('GET', '/api/stats')).json;
+    check(st1.fsyncs - st0.fsyncs < 200 && st1.max_batch > 1, 'fewer fsyncs than writes', { fsyncs: st1.fsyncs - st0.fsyncs, max_batch: st1.max_batch });
+    proc.kill('SIGKILL');
+    await new Promise((r) => proc.once('exit', r));
+    await start();
+    const gc = (await api('GET', '/api/todos?list=gc&limit=1000')).json;
+    check(gc.length === 200 && rs.every((r) => gc.some((g) => g.id === r.json.id)), 'every acknowledged write survived kill -9', gc.length);
+    // a failing commit turns the responses it held into 500s, and nothing is broadcast
+    check((await api('POST', '/api/fault')).status === 200, 'fault armed');
+    const bad = await api('POST', '/api/todos', { title: 'not durable' });
+    check(bad.status === 500 && bad.json?.error?.code === 'internal', 'held response replaced by 500', bad.status);
+    const ok = await api('POST', '/api/todos', { title: 'durable again', list: 'gc2' });
+    check(ok.status === 201, 'next commit succeeds');
+    for (const r of [...rs, ok]) await api('DELETE', `/api/todos/${r.json.id}`);
+    const left = (await api('GET', '/api/todos?limit=1000')).json.filter((t) => t.title !== 'not durable');
+    check(left.length === 1, 'cleanup', left.length);
+    const nd = (await api('GET', '/api/todos?limit=1000')).json.find((t) => t.title === 'not durable');
+    if (nd) await api('DELETE', `/api/todos/${nd.id}`);
+  }
+
   section('persistence');
   const before = (await api('GET', '/api/todos')).json;
   await stop();
@@ -120,7 +145,7 @@ try {
   const after = (await api('GET', '/api/todos')).json;
   check(JSON.stringify(after) === JSON.stringify(before), 'rows survive restart');
   const st = (await api('GET', '/api/stats')).json;
-  check(st.seq === 4 && st.rows === 1, 'stats after restart', st);
+  check(st.rows === 1 && st.seq > 4, 'stats after restart', st);
   check((await api('POST', '/api/compact')).json?.ok === true, 'compact');
   await stop();
   await start();

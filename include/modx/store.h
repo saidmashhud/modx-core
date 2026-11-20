@@ -137,6 +137,11 @@ struct mx_store {
     int64_t open_ms;           /* time db_open took (load + replay) */
     int64_t last_compact_ms;   /* duration of the last compaction (parent-side) */
     int64_t fsyncs;            /* number of journal fsyncs */
+    int64_t writes;            /* number of journal write batches */
+    int64_t max_batch;         /* most changes made durable by one fsync */
+    int fault_syncs;           /* testing: the next N syncs fail like an fsync error would */
+    sbuf pending;              /* group commit: records not written yet */
+    int64_t pending_records;
 };
 
 /* Opens (creating if needed) the data dir, loads the snapshot, replays the
@@ -164,9 +169,15 @@ int mx_store_put(mx_store *st, int coll, json *obj, const char *client_id);
 int mx_store_del(mx_store *st, int coll, const char *id, const char *client_id);
 int mx_store_del_key(mx_store *st, int coll, const char *id, const char *key, const char *client_id);
 
-/* fsync the journal and notify the listener of every newly durable change.
- * May start a compaction. Returns 0, or -1 on I/O error. */
+/* Group commit: mutations only queue their journal records. mx_store_sync
+ * writes everything queued with one write(), fsyncs once and then notifies
+ * the listener of every newly durable change. May start a compaction.
+ * Returns 0, or -1 on I/O error (nothing of the batch may be reported as
+ * durable then). */
 int mx_store_sync(mx_store *st);
+/* Adapters for http_server's durability barrier (ctx = the store). */
+int mx_store_pending_cb(void *st);
+int mx_store_commit_cb(void *st);
 /* 1 when changes were committed that are not durable yet. */
 int mx_store_dirty(const mx_store *st);
 

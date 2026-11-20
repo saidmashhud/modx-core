@@ -72,6 +72,8 @@ struct http_conn {
     size_t send_left;
     int resume;        /* input left unprocessed while a file was streaming */
     char ip[64];       /* peer address */
+    int held;          /* group commit: output waits for the durability barrier */
+    size_t hold_mark;  /* out.len before the first held response */
     void *app;         /* application data bound to the connection (e.g. an SSE subscription);
                           freed with http_server.app_free */
 };
@@ -91,6 +93,16 @@ struct http_server {
     size_t max_conns;              /* 0 = HTTP_MAX_CONNS */
     int64_t idle_ms;               /* 0 = HTTP_IDLE_MS */
     size_t nconns_peak;
+    /* Durability barrier (group commit). When set, a response produced while
+     * durable_pending() is true is held back; once per loop iteration
+     * durable_commit() runs (one write + one fsync for everything the
+     * iteration's requests changed) and only then are held responses sent.
+     * If the commit fails they are replaced by 500 responses. */
+    int (*durable_pending)(void *dctx);
+    int (*durable_commit)(void *dctx);
+    void *durable_ctx;
+    int64_t commits;             /* barrier commits run */
+    int64_t commit_failures;
     void *ctx;
 };
 

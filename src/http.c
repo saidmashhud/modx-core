@@ -360,6 +360,10 @@ static void process_input(http_server *srv, http_conn *c) {
         sbuf_init(&resp.body);
         sbuf_init(&resp.headers);
         srv->handler(srv, c, &req, &resp, srv->ctx);
+        if (srv->durable_pending && !resp.sse && srv->durable_pending(srv->durable_ctx) && !c->held) {
+            c->held = 1;
+            c->hold_mark = c->out.len;
+        }
         serialize_response(c, &req, &resp);
         if (resp.file_fd >= 0) close(resp.file_fd);
         sbuf_free(&resp.body);
@@ -374,6 +378,7 @@ static void process_input(http_server *srv, http_conn *c) {
 static int conn_pending(const http_conn *c) { return c->out.len > c->out_off || c->send_fd >= 0; }
 
 static void conn_flush(http_conn *c) {
+    if (c->held) return; /* waits for the durability barrier */
     for (;;) {
         while (c->out_off < c->out.len) {
             ssize_t w = write(c->fd, c->out.data + c->out_off, c->out.len - c->out_off);
@@ -485,6 +490,38 @@ static void reap(http_server *srv) {
     srv->nconns = k;
 }
 
+/* Group commit: make this iteration's changes durable, then release (or, on
+ * failure, replace) every held response. */
+static void barrier(http_server *srv) {
+    int held = 0;
+    for (size_t i = 0; i < srv->nconns && !held; i++) held = srv->conns[i]->held;
+    if (!srv->durable_commit) return;
+    int ok = 1;
+    if (srv->durable_pending && srv->durable_pending(srv->durable_ctx)) {
+        srv->commits++;
+        ok = srv->durable_commit(srv->durable_ctx) == 0;
+        if (!ok) srv->commit_failures++;
+    }
+    if (!held) return;
+    for (size_t i = 0; i < srv->nconns; i++) {
+        http_conn *c = srv->conns[i];
+        if (!c->held) continue;
+        c->held = 0;
+        if (!ok) {
+            /* nothing of what these responses report is durable */
+            c->out.len = c->hold_mark;
+            if (c->out.data) c->out.data[c->out.len] = 0;
+            if (c->send_fd >= 0) { close(c->send_fd); c->send_fd = -1; c->send_left = 0; }
+            static const char body[] = "{\"error\":{\"code\":\"internal\",\"message\":\"storage write failed\"}}";
+            sbuf_printf(&c->out,
+                        "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json; charset=utf-8\r\n"
+                        "Content-Length: %zu\r\nConnection: close\r\n\r\n%s", sizeof body - 1, body);
+            c->close_after_write = 1;
+            c->in.len = 0;
+        }
+    }
+}
+
 void http_server_run(http_server *srv, volatile sig_atomic_t *stop) {
     struct pollfd *pfds = NULL;
     size_t pcap = 0;
@@ -515,6 +552,7 @@ void http_server_run(http_server *srv, volatile sig_atomic_t *stop) {
             if (pfds[0].revents & POLLIN) accept_all(srv);
         }
         if (srv->tick) srv->tick(srv, srv->ctx);
+        barrier(srv);
         /* opportunistically flush everything queued this round (responses, SSE pushes) */
         for (size_t i = 0; i < srv->nconns; i++) {
             http_conn *c = srv->conns[i];
@@ -532,6 +570,7 @@ void http_server_run(http_server *srv, volatile sig_atomic_t *stop) {
 }
 
 void http_server_close(http_server *srv) {
+    barrier(srv); /* held responses go out only once their changes are durable */
     for (size_t i = 0; i < srv->nconns; i++) {
         http_conn *c = srv->conns[i];
         /* best-effort, non-blocking flush of pending output */

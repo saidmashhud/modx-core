@@ -9,7 +9,8 @@
  *   GET    /api/changes?since=<seq>                     -> [change, ...] or 410
  *   GET    /api/events                                  -> SSE (Last-Event-ID catch-up)
  *   GET    /api/stats                                   -> counters (bench)
- *   POST   /api/compact                                 -> start a compaction (TODO_ADMIN=1)
+ *   POST   /api/compact                                 -> compact now (TODO_ADMIN=1)
+ *   POST   /api/fault                                   -> fail the next commit (TODO_ADMIN=1, tests)
  *   anything else: static files from TODO_STATIC (default examples/todo/public)
  *
  * Environment: TODO_HOST (127.0.0.1), TODO_PORT (8080, 0 = any), TODO_DATA
@@ -119,7 +120,7 @@ static void create_todo(app *a, const http_request *req, http_response *resp) {
     json_set(row, "done", json_bool(0));
     json_set(row, "updated_at", json_num((double)now_ms()));
     json_free(b);
-    if (mx_store_put(a->st, C_TODOS, row, http_req_header(req, "x-client-id")) != 0 || mx_store_sync(a->st) != 0)
+    if (mx_store_put(a->st, C_TODOS, row, http_req_header(req, "x-client-id")) != 0)
         reply_err(resp, 500, "storage");
     else write_row(a, resp, 201, id);
     free(id);
@@ -137,7 +138,7 @@ static void update_todo(app *a, const http_request *req, http_response *resp, co
     if (done && done->type == JSON_BOOL) json_set(row, "done", json_bool(done->boolean));
     json_set(row, "updated_at", json_num((double)now_ms()));
     json_free(b);
-    if (mx_store_put(a->st, C_TODOS, row, http_req_header(req, "x-client-id")) != 0 || mx_store_sync(a->st) != 0)
+    if (mx_store_put(a->st, C_TODOS, row, http_req_header(req, "x-client-id")) != 0)
         reply_err(resp, 500, "storage");
     else write_row(a, resp, 200, id);
 }
@@ -185,9 +186,9 @@ static void handle(http_server *srv, http_conn *c, const http_request *req, http
         resp->content_type = "application/json; charset=utf-8";
         sbuf_printf(&resp->body,
                     "{\"seq\":%lld,\"rows\":%zu,\"journal_bytes\":%lld,\"open_ms\":%lld,\"last_compact_ms\":%lld,"
-                    "\"fsyncs\":%lld,\"conns\":%zu,\"peak_conns\":%zu,\"streams\":%zu,\"max_rss_kb\":%ld}",
+                    "\"fsyncs\":%lld,\"max_batch\":%lld,\"conns\":%zu,\"peak_conns\":%zu,\"streams\":%zu,\"max_rss_kb\":%ld}",
                     (long long)a->st->seq, mx_store_count(a->st, C_TODOS), (long long)a->st->journal_size,
-                    (long long)a->st->open_ms, (long long)a->st->last_compact_ms, (long long)a->st->fsyncs,
+                    (long long)a->st->open_ms, (long long)a->st->last_compact_ms, (long long)a->st->fsyncs, (long long)a->st->max_batch,
                     srv->nconns, srv->nconns_peak, mx_sse_count(&a->sse), rss_kb());
         return;
     }
@@ -198,6 +199,12 @@ static void handle(http_server *srv, http_conn *c, const http_request *req, http
         resp->content_type = "application/json; charset=utf-8";
         sbuf_printf(&resp->body, "{\"ok\":%s,\"blocked_ms\":%lld}", rc == 0 ? "true" : "false",
                     (long long)(mono_ms() - t0));
+        return;
+    }
+    if (strcmp(p, "/api/fault") == 0 && strcmp(m, "POST") == 0) {
+        if (!a->admin) { reply_err(resp, 403, "forbidden"); return; }
+        a->st->fault_syncs = 1; /* the next group commit fails */
+        reply_json(resp, 200, "{\"ok\":true}");
         return;
     }
     if (get && strcmp(p, "/api/changes") == 0) {
@@ -232,7 +239,7 @@ static void handle(http_server *srv, http_conn *c, const http_request *req, http
             update_todo(a, req, resp, id);
         } else if (strcmp(m, "DELETE") == 0) {
             if (!mx_store_get(a->st, C_TODOS, id)) { reply_err(resp, 404, "not_found"); return; }
-            if (mx_store_del(a->st, C_TODOS, id, NULL) != 0 || mx_store_sync(a->st) != 0) reply_err(resp, 500, "storage");
+            if (mx_store_del(a->st, C_TODOS, id, NULL) != 0) reply_err(resp, 500, "storage");
             else resp->status = 204;
         } else {
             reply_err(resp, 405, "method_not_allowed");
@@ -322,6 +329,10 @@ int main(void) {
     mx_sse_init(&a.sse, &srv, 15000);
     a.st->listener = on_durable;
     a.st->listener_ctx = &a;
+    /* group commit: one fsync per loop iteration, responses after it */
+    srv.durable_pending = mx_store_pending_cb;
+    srv.durable_commit = mx_store_commit_cb;
+    srv.durable_ctx = a.st;
     srv.handler = handle;
     srv.tick = tick;
     srv.ctx = &a;
