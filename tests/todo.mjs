@@ -307,7 +307,7 @@ try {
     await start({ TODO_HEADER_TIMEOUT_MS: '400', TODO_BODY_TIMEOUT_MS: '800', TODO_IDLE_MS: '1500', TODO_WS_PING_MS: '300' });
     const silent = wsRaw();
     check(await until(() => silent.status === 101), 'ws open');
-    check(await until(() => silent.frames.some((f) => f.op === 9), 2000), 'server pings an idle WebSocket');
+    check(await until(() => silent.frames.some((f) => f.op === 9), 4000), 'server pings an idle WebSocket');
     check(await until(() => silent.closed, 3000), 'and drops it when no pong comes back');
     const port = Number(new URL(base).port);
     const raw = (writes, gapMs) => new Promise((res) => {

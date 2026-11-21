@@ -4,14 +4,14 @@ OPT      ?= -O2
 SAN      ?=
 STD      := -std=c11 -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE
 WARN     := -Wall -Wextra -Werror
-ALL_CFLAGS  := $(OPT) $(SAN) $(STD) $(WARN) -Iinclude $(CFLAGS)
-ALL_LDFLAGS := $(SAN) $(LDFLAGS)
 ZLIB     ?= 1
 ifeq ($(ZLIB),1)
 LDLIBS   += -lz
 else
 CFLAGS   += -DMODX_NO_ZLIB
 endif
+ALL_CFLAGS  := $(OPT) $(SAN) $(STD) $(WARN) -Iinclude $(CFLAGS)
+ALL_LDFLAGS := $(SAN) $(LDFLAGS)
 LDLIBS   += -lm
 
 BUILD    ?= build
