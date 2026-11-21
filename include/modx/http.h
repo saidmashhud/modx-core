@@ -87,6 +87,8 @@ struct http_conn {
     sbuf ws_msg;       /* fragments so far */
     int64_t ws_ping_due; /* a ping is out; the peer must answer before this (0 = none) */
     int want_write;    /* registered for writability with kqueue / epoll */
+    http_server *srv;  /* the server that accepted it */
+    sbuf deferred;     /* group commit: pushes queued while changes were pending, sent after them */
     int held;          /* group commit: output waits for the durability barrier */
     size_t hold_mark;  /* out.len before the first held response */
     void *app;         /* application data bound to the connection (e.g. an SSE subscription);
@@ -136,6 +138,7 @@ struct http_server {
     struct pollfd *pfds;         /* poll() fallback set */
     size_t pcap;
     int running;
+    int in_barrier;
     int64_t commits;             /* barrier commits run */
     int64_t commit_failures;
     void *ctx;
@@ -174,7 +177,11 @@ const char *http_server_poller(const http_server *srv);
 void http_server_run(http_server *srv, volatile sig_atomic_t *stop);
 void http_server_close(http_server *srv);
 
-/* Queue bytes on a connection (used for SSE pushes). Marks it dead on overflow. */
+/* Queue bytes on a connection (SSE / WebSocket pushes). Marks it dead on
+ * overflow. With a durability barrier, bytes pushed while changes are
+ * pending wait for the commit and go out right after the change
+ * notifications it triggers (dropped if the commit fails), so nothing is
+ * announced before what it refers to is durable. */
 void http_conn_send(http_conn *c, const char *data, size_t len);
 
 #endif

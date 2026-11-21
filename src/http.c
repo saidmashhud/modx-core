@@ -270,7 +270,12 @@ int http_server_listen(http_server *srv, const char *host, int port) {
 
 void http_conn_send(http_conn *c, const char *data, size_t len) {
     if (c->dead) return;
-    if (c->out.len - c->out_off + len > HTTP_SSE_MAX_BACKLOG) { c->dead = 1; return; }
+    if (c->out.len - c->out_off + c->deferred.len + len > HTTP_SSE_MAX_BACKLOG) { c->dead = 1; return; }
+    http_server *srv = c->srv;
+    if (srv && srv->durable_pending && !srv->in_barrier && srv->durable_pending(srv->durable_ctx)) {
+        sbuf_put(&c->deferred, data, len);
+        return;
+    }
     sbuf_put(&c->out, data, len);
 }
 
@@ -281,6 +286,7 @@ static void conn_free(http_server *srv, http_conn *c) {
     sbuf_free(&c->in);
     sbuf_free(&c->out);
     sbuf_free(&c->ws_msg);
+    sbuf_free(&c->deferred);
     free(c);
 }
 
@@ -514,6 +520,7 @@ static void accept_all(http_server *srv) {
         sbuf_init(&c->out);
         c->send_fd = -1;
         c->last_active = mono_ms();
+        c->srv = srv;
         srv->conns = xrealloc(srv->conns, (srv->nconns + 1) * sizeof *srv->conns);
         srv->conns[srv->nconns++] = c;
         if (srv->nconns > srv->nconns_peak) srv->nconns_peak = srv->nconns;
@@ -581,8 +588,18 @@ static void barrier(http_server *srv) {
     int ok = 1;
     if (srv->durable_pending && srv->durable_pending(srv->durable_ctx)) {
         srv->commits++;
+        srv->in_barrier = 1; /* notifications sent by the commit go straight out */
         ok = srv->durable_commit(srv->durable_ctx) == 0;
+        srv->in_barrier = 0;
         if (!ok) srv->commit_failures++;
+    }
+    /* pushes queued during the iteration follow the change notifications */
+    for (size_t i = 0; i < srv->nconns; i++) {
+        http_conn *c = srv->conns[i];
+        if (!c->deferred.len) continue;
+        if (ok && !c->dead) sbuf_put(&c->out, c->deferred.data, c->deferred.len);
+        c->deferred.len = 0;
+        if (c->deferred.cap > 65536) sbuf_free(&c->deferred);
     }
     if (!held) return;
     for (size_t i = 0; i < srv->nconns; i++) {
