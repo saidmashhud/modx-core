@@ -26,6 +26,7 @@ bench/          load generator + driver   examples/todo  a complete server on th
 | Crypto | `crypto.h` | SHA-256, HMAC, PBKDF2, SHA-1 (WebSocket only), base64, hex, constant-time compare, OS randomness, password hashes |
 | Sessions | `session.h` | cookie parsing, Origin/Host CSRF check, JSON content type, `X-Forwarded-For`, failure throttling, session tokens (store the hash) |
 | Static files | `static.h` | safe paths, MIME types, SPA fallback, immutable caching for hashed assets, weak ETag / 304 |
+| Idempotency keys | `idem.h` | `Idempotency-Key` validation, remembered answers (2xx / 4xx) replayed with `Idempotent-Replayed: true`, method + target mismatch check, pruning by age and per-owner cap; records live in a private store collection |
 | Response cache | `cache.h` | LRU of bodies valid only for the store `seq` they were built at |
 | OT | `ot.h` | plain-text operational transformation (UTF-16 offsets, compatible with ot.js) |
 | Timers | `timer.h` | periodic jobs for the loop tick |

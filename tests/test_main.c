@@ -12,6 +12,7 @@ int main(void) {
     test_timer_all();
     test_gzip_all();
     test_ws_all();
+    test_idem_all();
     fprintf(stderr, "\nunit: %d checks, %d failed\n", t_checks, t_failures);
     return t_failures ? 1 : 0;
 }

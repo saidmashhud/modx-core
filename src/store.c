@@ -522,7 +522,18 @@ static int64_t replay_file(mx_store *st, const char *path, int64_t snap_seq, int
             json *data = json_get(ch, "data");
             if (data && data->type != JSON_OBJECT) data = NULL;
             int is_put = op && strcmp(op, "put") == 0, is_del = op && strcmp(op, "del") == 0;
-            if (coll < 0 || !cid || (!is_put && !is_del) || (is_put && !data)) { json_free(ch); break; }
+            if (!cid || (!is_put && !is_del) || (is_put && !data)) { json_free(ch); break; }
+            if (coll < 0) {
+                /* a well-formed record (its CRC matched) of a collection this build does not know:
+                 * written by a newer version. Skip it, but keep its seq, instead of cutting the
+                 * journal there (a rollback must not lose the records after it). */
+                st->seq = seq;
+                st->skipped_records++;
+                json_free(ch);
+                pos += line_len + 1;
+                good_end = pos;
+                continue;
+            }
             char *key = key_for(st, coll, cid, ch, data);
             const char *client_id = json_get_str(ch, "client_id");
             int64_t ts = (int64_t)json_get_num(ch, "ts", 0);

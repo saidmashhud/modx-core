@@ -146,6 +146,8 @@ struct mx_store {
     mx_store_hooks hooks;
     int64_t compact_threshold; /* bytes; journal is compacted when it grows past this */
     int recovered_truncated;   /* set when a torn/corrupt tail was cut on open */
+    int64_t skipped_records;   /* journal records of unknown collections skipped on open (a newer
+                                  version wrote them; they are dropped at the next compaction) */
     void *app;                 /* free for the application */
     int loading;               /* 1 while on_apply sees the rows of the snapshot being loaded */
     /* stats */

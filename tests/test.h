@@ -31,5 +31,6 @@ void test_store_all(void);
 void test_timer_all(void);
 void test_ws_all(void);
 void test_gzip_all(void);
+void test_idem_all(void);
 
 #endif

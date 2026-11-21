@@ -214,6 +214,44 @@ static void t_torn_tail(void) {
     rm_rf(dir);
 }
 
+/* A well-formed record of a collection this build does not know (a newer
+ * version wrote it) is skipped, its seq kept; the records after it stay. */
+static void t_unknown_collection(void) {
+    char *dir = make_tmpdir();
+    char *jp = file_path(dir, "journal.log");
+    mx_store *st = open_st(dir, 100);
+    mx_store_put(st, T_ITEMS, item("a", 1), NULL);
+    mx_store_sync(st);
+    mx_store_close(st);
+    const char *recs[] = {
+        "{\"seq\":2,\"entity\":\"from_the_future\",\"op\":\"put\",\"id\":\"f\",\"data\":{\"id\":\"f\"},\"ts\":1}",
+        "{\"seq\":3,\"entity\":\"items\",\"op\":\"put\",\"id\":\"b\",\"data\":{\"id\":\"b\"},\"ts\":1}",
+    };
+    for (int i = 0; i < 2; i++) {
+        char hdr[16];
+        snprintf(hdr, sizeof hdr, "%08x ", crc32_buf(recs[i], strlen(recs[i])));
+        sbuf rec;
+        sbuf_init(&rec);
+        sbuf_puts(&rec, hdr);
+        sbuf_puts(&rec, recs[i]);
+        sbuf_putc(&rec, '\n');
+        append_raw(jp, rec.data);
+        sbuf_free(&rec);
+    }
+    long size = file_size(jp);
+    st = open_st(dir, 100);
+    CHECK(st && st->recovered_truncated == 0 && st->skipped_records == 1 && st->seq == 3);
+    CHECK(st && mx_store_get(st, T_ITEMS, "b") && file_size(jp) == size);
+    /* the next seq does not reuse the skipped one */
+    CHECK(st && mx_store_put(st, T_ITEMS, item("c", 3), NULL) == 0 && mx_store_sync(st) == 0 && st->seq == 4);
+    mx_store_close(st);
+    st = open_st(dir, 100);
+    CHECK(st && st->seq == 4 && mx_store_count(st, T_ITEMS) == 3);
+    mx_store_close(st);
+    free(jp);
+    rm_rf(dir);
+}
+
 static void t_crc_mismatch(void) {
     char *dir = make_tmpdir();
     char *jp = file_path(dir, "journal.log");
@@ -628,6 +666,7 @@ void test_store_all(void) {
     RUN(t_append_reload);
     RUN(t_torn_tail);
     RUN(t_crc_mismatch);
+    RUN(t_unknown_collection);
     RUN(t_compaction);
     RUN(t_ring_window);
     RUN(t_flags_hooks);
