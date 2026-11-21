@@ -1,0 +1,158 @@
+{
+  "label": "paired-2-group-commit",
+  "profile": "full",
+  "params": {
+    "rows": 100000,
+    "dur": 8,
+    "conns": 64,
+    "subs": 1000,
+    "writes": 200,
+    "pause": 3000,
+    "fill": 8,
+    "idle": 2000
+  },
+  "poller": "native",
+  "hardware": {
+    "cpu": "Apple M1 Pro",
+    "cores": 10,
+    "mem_gib": 16,
+    "os": "darwin 27.2.0",
+    "disk": "File System Personality: APFS; Protocol: Apple Fabric; Solid State: Yes",
+    "node": "v22.23.1",
+    "loadavg_at_start": [
+      5.8,
+      4.6,
+      11.3
+    ]
+  },
+  "date": "2026-11-21T02:13:59.741Z",
+  "scenarios": {
+    "seed": {
+      "rows": 100000,
+      "wall_ms": 900
+    },
+    "startup": {
+      "rows": 100000,
+      "wall_ms": 113,
+      "open_ms": 106,
+      "startup_ms": 106,
+      "rss_kb": 106928
+    },
+    "get": {
+      "code": 0,
+      "mode": "get",
+      "idle": 0,
+      "conns": 64,
+      "duration_s": 8,
+      "requests": 819034,
+      "errors": 0,
+      "non2xx": 0,
+      "rps": 102374,
+      "p50_ms": 0.488,
+      "p95_ms": 0.963,
+      "p99_ms": 1.16,
+      "max_ms": 3.447,
+      "rss_kb": 86976
+    },
+    "list": {
+      "code": 0,
+      "mode": "list",
+      "idle": 0,
+      "conns": 64,
+      "duration_s": 8.45,
+      "requests": 961,
+      "errors": 0,
+      "non2xx": 0,
+      "rps": 114,
+      "p50_ms": 559.812,
+      "p95_ms": 574.686,
+      "p99_ms": 574.726,
+      "max_ms": 574.89,
+      "rss_kb": 95936
+    },
+    "write": {
+      "code": 0,
+      "mode": "write",
+      "idle": 0,
+      "conns": 64,
+      "duration_s": 8.09,
+      "requests": 371238,
+      "errors": 0,
+      "non2xx": 0,
+      "rps": 45903,
+      "p50_ms": 0.877,
+      "p95_ms": 1.166,
+      "p99_ms": 1.56,
+      "max_ms": 177.736,
+      "rss_kb": 185472
+    },
+    "mixed": {
+      "code": 0,
+      "mode": "mixed",
+      "idle": 0,
+      "conns": 64,
+      "duration_s": 8.06,
+      "requests": 7320,
+      "errors": 0,
+      "non2xx": 0,
+      "rps": 908,
+      "p50_ms": 71.919,
+      "p95_ms": 119.193,
+      "p99_ms": 129.916,
+      "max_ms": 140.729,
+      "rss_kb": 117648
+    },
+    "idle": {
+      "code": 0,
+      "mode": "get",
+      "idle": 2000,
+      "conns": 64,
+      "duration_s": 8,
+      "requests": 281748,
+      "errors": 0,
+      "non2xx": 0,
+      "rps": 35212,
+      "p50_ms": 2.005,
+      "p95_ms": 2.437,
+      "p99_ms": 2.972,
+      "max_ms": 6.305,
+      "rss_kb": 113104
+    },
+    "sse": {
+      "code": 0,
+      "mode": "sse",
+      "subs": 1000,
+      "writes": 200,
+      "open_ms": 63,
+      "expected": 200000,
+      "delivered": 200000,
+      "elapsed_s": 1.25,
+      "events_per_s": 159599,
+      "deliver_p50_ms": 4.537,
+      "deliver_p95_ms": 7.795,
+      "deliver_p99_ms": 11.195,
+      "write_p50_ms": 2.569,
+      "write_p99_ms": 6.375,
+      "rss_kb": 112944
+    },
+    "compact": {
+      "rows": 100000,
+      "request_ms": 194,
+      "blocked_ms": 170,
+      "last_compact_ms": 170,
+      "reads_p50_ms": 0.132,
+      "reads_p99_ms": 0.297,
+      "reads_max_ms": 170.216,
+      "reads_rps": 94248
+    },
+    "recovery": {
+      "rows": 100000,
+      "journal_records": 450189,
+      "journal_bytes": 96739329,
+      "wall_ms": 2755,
+      "open_ms": 2747,
+      "startup_ms": 2747,
+      "rss_kb": 208784
+    }
+  }
+}

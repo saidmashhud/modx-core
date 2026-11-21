@@ -134,9 +134,9 @@ static void t_password(void) {
     CHECK(!password_verify("x", "pbkdf2_sha256$abc$00$00"));
     CHECK(!password_verify("x", "pbkdf2_sha256$1$zz$00"));
     /* the default cost is the contract's */
-    char *def = password_hash("modx-demo-2026");
+    char *def = password_hash("example-passphrase");
     CHECK(def && strncmp(def, "pbkdf2_sha256$150000$", 21) == 0);
-    CHECK(password_verify("modx-demo-2026", def));
+    CHECK(password_verify("example-passphrase", def));
     free(def);
 }
 

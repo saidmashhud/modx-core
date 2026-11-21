@@ -1,0 +1,158 @@
+{
+  "label": "paired-0-baseline",
+  "profile": "full",
+  "params": {
+    "rows": 100000,
+    "dur": 8,
+    "conns": 64,
+    "subs": 1000,
+    "writes": 200,
+    "pause": 3000,
+    "fill": 8,
+    "idle": 2000
+  },
+  "poller": "native",
+  "hardware": {
+    "cpu": "Apple M1 Pro",
+    "cores": 10,
+    "mem_gib": 16,
+    "os": "darwin 27.2.0",
+    "disk": "File System Personality: APFS; Protocol: Apple Fabric; Solid State: Yes",
+    "node": "v22.23.1",
+    "loadavg_at_start": [
+      4,
+      4.4,
+      12.2
+    ]
+  },
+  "date": "2026-11-21T02:12:08.054Z",
+  "scenarios": {
+    "seed": {
+      "rows": 100000,
+      "wall_ms": 1089
+    },
+    "startup": {
+      "rows": 100000,
+      "wall_ms": 115,
+      "open_ms": 107,
+      "startup_ms": 107,
+      "rss_kb": 106928
+    },
+    "get": {
+      "code": 0,
+      "mode": "get",
+      "idle": 0,
+      "conns": 64,
+      "duration_s": 8,
+      "requests": 817202,
+      "errors": 0,
+      "non2xx": 0,
+      "rps": 102146,
+      "p50_ms": 0.479,
+      "p95_ms": 0.992,
+      "p99_ms": 1.202,
+      "max_ms": 2.806,
+      "rss_kb": 96192
+    },
+    "list": {
+      "code": 0,
+      "mode": "list",
+      "idle": 0,
+      "conns": 64,
+      "duration_s": 8.14,
+      "requests": 897,
+      "errors": 0,
+      "non2xx": 0,
+      "rps": 110,
+      "p50_ms": 579.117,
+      "p95_ms": 587.274,
+      "p99_ms": 587.538,
+      "max_ms": 587.657,
+      "rss_kb": 101088
+    },
+    "write": {
+      "code": 0,
+      "mode": "write",
+      "idle": 0,
+      "conns": 64,
+      "duration_s": 8,
+      "requests": 122821,
+      "errors": 0,
+      "non2xx": 0,
+      "rps": 15347,
+      "p50_ms": 3.844,
+      "p95_ms": 4.709,
+      "p99_ms": 6.167,
+      "max_ms": 156.986,
+      "rss_kb": 152672
+    },
+    "mixed": {
+      "code": 0,
+      "mode": "mixed",
+      "idle": 0,
+      "conns": 64,
+      "duration_s": 8.03,
+      "requests": 7795,
+      "errors": 0,
+      "non2xx": 0,
+      "rps": 971,
+      "p50_ms": 62.665,
+      "p95_ms": 111.852,
+      "p99_ms": 140.093,
+      "max_ms": 148.041,
+      "rss_kb": 119040
+    },
+    "idle": {
+      "code": 0,
+      "mode": "get",
+      "idle": 2000,
+      "conns": 64,
+      "duration_s": 8,
+      "requests": 278810,
+      "errors": 0,
+      "non2xx": 0,
+      "rps": 34843,
+      "p50_ms": 1.97,
+      "p95_ms": 2.286,
+      "p99_ms": 2.654,
+      "max_ms": 4.189,
+      "rss_kb": 108880
+    },
+    "sse": {
+      "code": 0,
+      "mode": "sse",
+      "subs": 1000,
+      "writes": 200,
+      "open_ms": 64,
+      "expected": 200000,
+      "delivered": 200000,
+      "elapsed_s": 1.17,
+      "events_per_s": 170710,
+      "deliver_p50_ms": 4.416,
+      "deliver_p95_ms": 5.824,
+      "deliver_p99_ms": 7.288,
+      "write_p50_ms": 2.551,
+      "write_p99_ms": 4.597,
+      "rss_kb": 122352
+    },
+    "compact": {
+      "rows": 100000,
+      "request_ms": 181,
+      "blocked_ms": 155,
+      "last_compact_ms": 155,
+      "reads_p50_ms": 0.132,
+      "reads_p99_ms": 0.282,
+      "reads_max_ms": 155.959,
+      "reads_rps": 94470
+    },
+    "recovery": {
+      "rows": 100000,
+      "journal_records": 131719,
+      "journal_bytes": 28305606,
+      "wall_ms": 923,
+      "open_ms": 914,
+      "startup_ms": 914,
+      "rss_kb": 149168
+    }
+  }
+}

@@ -108,7 +108,7 @@ try {
     const reqMs = Math.round(performance.now() - t0);
     const reads = await lg;
     let st = await stats();
-    for (let i = 0; i < 600 && (st.compacting || st.compactions === before.compactions); i++) { await sleep(100); st = await stats(); }
+    for (let i = 0; 'compactions' in st && i < 600 && (st.compacting || st.compactions === before.compactions); i++) { await sleep(100); st = await stats(); }
     results.scenarios.compact = { rows: P.rows, request_ms: reqMs, blocked_ms: c.blocked_ms, last_compact_ms: st.last_compact_ms, reads_p50_ms: reads.p50_ms, reads_p99_ms: reads.p99_ms, reads_max_ms: reads.max_ms, reads_rps: reads.rps };
     console.error(`  compact: blocked ${c.blocked_ms} ms, reads max ${reads.max_ms} ms`);
   }

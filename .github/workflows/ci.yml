@@ -1,0 +1,79 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, ${{ matrix.cc }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        cc: [gcc, clang]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: zlib headers
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
+      - name: pick the compiler
+        run: |
+          cc=${{ matrix.cc }}
+          if [ "$RUNNER_OS" = macOS ] && [ "$cc" = gcc ]; then
+            # Apple's gcc is clang; use a real GCC from Homebrew
+            command -v gcc-14 >/dev/null || brew install gcc@14
+            cc=gcc-14
+          fi
+          echo "CC=$cc" >> "$GITHUB_ENV"
+          $cc --version
+      - name: unit + example tests (kqueue / epoll and the poll() fallback at runtime)
+        run: make test
+      - name: compile-time poll() fallback
+        run: make BUILD=build-poll CFLAGS=-DMODX_POLLER_POLL build-poll/test_unit build-poll/todo && ./build-poll/test_unit
+      - name: without zlib
+        run: make BUILD=build-nozlib ZLIB=0 build-nozlib/test_unit && ./build-nozlib/test_unit
+
+  sanitizers:
+    runs-on: ubuntu-latest
+    env:
+      CC: clang
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
+      - name: ASan + UBSan (unit + example)
+        run: make test-debug
+      - name: mutation fuzzing (stand-alone driver, ASan + UBSan)
+        run: make fuzz FUZZ_ITERS=200000
+
+  libfuzzer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
+      - name: libFuzzer, 60 s per target
+        run: make fuzz-libfuzzer FUZZ_SECONDS=60
+
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
+      - name: short benchmark profile (numbers are for trends only: shared CI runners)
+        run: make bench-quick | tee bench-summary.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: |
+            bench/results/*.json
+            bench-summary.md
