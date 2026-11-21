@@ -75,6 +75,9 @@ try {
   await start();
   section('health, static');
   check((await api('GET', '/api/health')).json?.ok === true, 'health');
+  const poller = (await api('GET', '/api/stats')).json.poller;
+  console.log(`  poller: ${poller}`);
+  check(process.env.TODO_POLL === '1' ? poller === 'poll' : poller !== '', 'poller', poller);
   const idx = await api('GET', '/');
   check(idx.status === 200 && idx.text.includes('<title>t</title>'), 'index.html');
   check(!(await api('GET', '/%2e%2e/%2e%2e/etc/passwd')).text.includes('root:'), 'no traversal');
@@ -156,6 +159,17 @@ try {
     for (let i = 0; i < 100 && st.compactions < 1; i++) { await sleep(50); st = (await api('GET', '/api/stats')).json; }
     check(c2.json?.ok && st.compactions >= 1, 'background compaction completes', st);
     for (const r of [...rs, more]) await api('DELETE', `/api/todos/${r.json.id}`);
+  }
+
+  section('connection limit');
+  {
+    // TODO_MAX_CONNS is 4096 by default; open 300 idle keep-alive sockets and still get served
+    const socks = await Promise.all(Array.from({ length: 300 }, () => new Promise((res) => { const s = net.connect(Number(new URL(base).port), '127.0.0.1', () => res(s)); s.on('error', () => res(s)); })));
+    await sleep(100);
+    check((await api('GET', '/api/health')).status === 200, 'served with 300 idle sockets');
+    const st = (await api('GET', '/api/stats')).json;
+    check(st.conns >= 300, 'server sees them', st.conns);
+    socks.forEach((s) => s.destroy());
   }
 
   section('persistence');

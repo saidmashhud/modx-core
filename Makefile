@@ -52,6 +52,7 @@ test-unit: $(BUILD)/test_unit
 
 test-example: $(BUILD)/todo
 	node tests/todo.mjs ./$(BUILD)/todo
+	TODO_POLL=1 node tests/todo.mjs ./$(BUILD)/todo
 
 test: test-unit test-example
 

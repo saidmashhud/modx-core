@@ -15,7 +15,8 @@
  *
  * Environment: TODO_HOST (127.0.0.1), TODO_PORT (8080, 0 = any), TODO_DATA
  * (./todo-data), TODO_STATIC, TODO_SEED=<n> (seed n rows into an empty store),
- * TODO_COMPACT_BYTES, TODO_MAX_CONNS, TODO_ADMIN=1. */
+ * TODO_COMPACT_BYTES, TODO_MAX_CONNS (4096), TODO_POLL=1 (poll() instead of
+ * kqueue / epoll), TODO_ADMIN=1. */
 
 #include <errno.h>
 #include <signal.h>
@@ -186,11 +187,11 @@ static void handle(http_server *srv, http_conn *c, const http_request *req, http
         resp->content_type = "application/json; charset=utf-8";
         sbuf_printf(&resp->body,
                     "{\"seq\":%lld,\"rows\":%zu,\"journal_bytes\":%lld,\"open_ms\":%lld,\"last_compact_ms\":%lld,"
-                    "\"compactions\":%lld,\"compacting\":%s,\"fsyncs\":%lld,\"max_batch\":%lld,\"conns\":%zu,\"peak_conns\":%zu,\"streams\":%zu,\"max_rss_kb\":%ld}",
+                    "\"compactions\":%lld,\"compacting\":%s,\"fsyncs\":%lld,\"max_batch\":%lld,\"poller\":\"%s\",\"conns\":%zu,\"peak_conns\":%zu,\"streams\":%zu,\"max_rss_kb\":%ld}",
                     (long long)a->st->seq, mx_store_count(a->st, C_TODOS), (long long)a->st->journal_size,
                     (long long)a->st->open_ms, (long long)a->st->last_compact_ms, (long long)a->st->compactions,
                     a->st->compact_pid > 0 ? "true" : "false", (long long)a->st->fsyncs, (long long)a->st->max_batch,
-                    srv->nconns, srv->nconns_peak, mx_sse_count(&a->sse), rss_kb());
+                    http_server_poller(srv), srv->nconns, srv->nconns_peak, mx_sse_count(&a->sse), rss_kb());
         return;
     }
     if (strcmp(p, "/api/compact") == 0 && strcmp(m, "POST") == 0) {
@@ -324,6 +325,7 @@ int main(void) {
     memset(&srv, 0, sizeof srv);
     srv.listen_fd = -1;
     srv.max_conns = (size_t)env_long("TODO_MAX_CONNS", 4096);
+    srv.use_poll = env_long("TODO_POLL", 0) == 1;
     if (http_server_listen(&srv, host, (int)port) != 0) {
         fprintf(stderr, "todo: cannot listen on %s:%ld: %s\n", host, port, strerror(errno));
         return 1;

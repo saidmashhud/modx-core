@@ -233,6 +233,8 @@ long http_parse_request_need(const char *buf, size_t len, http_request *req, int
 
 /* ---------------- server ---------------- */
 
+static void poller_add(http_server *srv, http_conn *c);
+
 static int set_nonblock(int fd) {
     int fl = fcntl(fd, F_GETFL, 0);
     if (fl < 0) return -1;
@@ -258,6 +260,7 @@ int http_server_listen(http_server *srv, const char *host, int port) {
     socklen_t al = sizeof addr;
     getsockname(fd, (struct sockaddr *)&addr, &al);
     srv->listen_fd = fd;
+    srv->poll_fd = -1;
     srv->port = ntohs(addr.sin_port);
     return 0;
 }
@@ -468,6 +471,7 @@ static void accept_all(http_server *srv) {
         srv->conns = xrealloc(srv->conns, (srv->nconns + 1) * sizeof *srv->conns);
         srv->conns[srv->nconns++] = c;
         if (srv->nconns > srv->nconns_peak) srv->nconns_peak = srv->nconns;
+        if (srv->running) poller_add(srv, c);
     }
 }
 
@@ -522,38 +526,164 @@ static void barrier(http_server *srv) {
     }
 }
 
+/* ---------------- pollers ----------------
+ * kqueue (macOS / BSD) and epoll (Linux) register each socket once and
+ * return only ready ones; poll() rebuilds the whole set every iteration and
+ * is kept as the portable fallback (and for tests: http_server.use_poll). */
+
+#if defined(MODX_POLLER_POLL)
+#define HAVE_KQUEUE 0
+#define HAVE_EPOLL 0
+#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) || defined(__DragonFly__)
+#define HAVE_KQUEUE 1
+#define HAVE_EPOLL 0
+#include <sys/event.h>
+#elif defined(__linux__)
+#define HAVE_KQUEUE 0
+#define HAVE_EPOLL 1
+#include <sys/epoll.h>
+#else
+#define HAVE_KQUEUE 0
+#define HAVE_EPOLL 0
+#endif
+
+const char *http_server_poller(const http_server *srv) {
+    if (srv->use_poll || srv->poll_fd < 0) return "poll";
+    return HAVE_KQUEUE ? "kqueue" : HAVE_EPOLL ? "epoll" : "poll";
+}
+
+static int poller_open(http_server *srv) {
+    srv->poll_fd = -1;
+    if (srv->use_poll) return 0;
+#if HAVE_KQUEUE
+    srv->poll_fd = kqueue();
+    if (srv->poll_fd < 0) return 0; /* fall back to poll() */
+    struct kevent ev;
+    EV_SET(&ev, srv->listen_fd, EVFILT_READ, EV_ADD, 0, 0, NULL);
+    if (kevent(srv->poll_fd, &ev, 1, NULL, 0, NULL) != 0) { close(srv->poll_fd); srv->poll_fd = -1; }
+#elif HAVE_EPOLL
+    srv->poll_fd = epoll_create1(EPOLL_CLOEXEC);
+    if (srv->poll_fd < 0) return 0;
+    struct epoll_event ev;
+    memset(&ev, 0, sizeof ev);
+    ev.events = EPOLLIN;
+    ev.data.ptr = NULL;
+    if (epoll_ctl(srv->poll_fd, EPOLL_CTL_ADD, srv->listen_fd, &ev) != 0) { close(srv->poll_fd); srv->poll_fd = -1; }
+#endif
+    return 0;
+}
+
+static void poller_add(http_server *srv, http_conn *c) {
+    if (srv->poll_fd < 0) return;
+#if HAVE_KQUEUE
+    struct kevent ev;
+    EV_SET(&ev, c->fd, EVFILT_READ, EV_ADD, 0, 0, c);
+    if (kevent(srv->poll_fd, &ev, 1, NULL, 0, NULL) != 0) c->dead = 1;
+#elif HAVE_EPOLL
+    struct epoll_event ev;
+    memset(&ev, 0, sizeof ev);
+    ev.events = EPOLLIN | EPOLLRDHUP;
+    ev.data.ptr = c;
+    if (epoll_ctl(srv->poll_fd, EPOLL_CTL_ADD, c->fd, &ev) != 0) c->dead = 1;
+#else
+    (void)c;
+#endif
+}
+
+/* Ask for writability only while output is waiting (no busy wake-ups). */
+static void poller_want_write(http_server *srv, http_conn *c, int want) {
+    if (srv->poll_fd < 0 || c->want_write == want || c->dead) return;
+    c->want_write = want;
+#if HAVE_KQUEUE
+    struct kevent ev;
+    EV_SET(&ev, c->fd, EVFILT_WRITE, want ? EV_ADD : EV_DELETE, 0, 0, c);
+    kevent(srv->poll_fd, &ev, 1, NULL, 0, NULL);
+#elif HAVE_EPOLL
+    struct epoll_event ev;
+    memset(&ev, 0, sizeof ev);
+    ev.events = EPOLLIN | EPOLLRDHUP | (want ? EPOLLOUT : 0);
+    ev.data.ptr = c;
+    epoll_ctl(srv->poll_fd, EPOLL_CTL_MOD, c->fd, &ev);
+#endif
+}
+
+#define POLLER_BATCH 256
+
+/* Wait for events (up to timeout_ms) and handle them. */
+static void wait_events(http_server *srv, int timeout_ms, volatile sig_atomic_t *stop) {
+#if HAVE_KQUEUE
+    if (srv->poll_fd >= 0) {
+        struct kevent evs[POLLER_BATCH];
+        struct timespec ts = { timeout_ms / 1000, (long)(timeout_ms % 1000) * 1000000L };
+        int n = kevent(srv->poll_fd, NULL, 0, evs, POLLER_BATCH, &ts);
+        if (n < 0 && errno != EINTR) { perror("kevent"); *stop = 1; return; }
+        if (*stop) return;
+        int accept_ready = 0;
+        for (int i = 0; i < n; i++) {
+            http_conn *c = evs[i].udata;
+            if (!c) { accept_ready = 1; continue; }
+            if (c->dead) continue;
+            if (evs[i].filter == EVFILT_READ) conn_read(srv, c);
+            else if (evs[i].filter == EVFILT_WRITE) conn_flush(c);
+        }
+        if (accept_ready) accept_all(srv);
+        return;
+    }
+#elif HAVE_EPOLL
+    if (srv->poll_fd >= 0) {
+        struct epoll_event evs[POLLER_BATCH];
+        int n = epoll_wait(srv->poll_fd, evs, POLLER_BATCH, timeout_ms);
+        if (n < 0 && errno != EINTR) { perror("epoll_wait"); *stop = 1; return; }
+        if (*stop) return;
+        int accept_ready = 0;
+        for (int i = 0; i < n; i++) {
+            http_conn *c = evs[i].data.ptr;
+            if (!c) { accept_ready = 1; continue; }
+            if (c->dead) continue;
+            if (evs[i].events & (EPOLLIN | EPOLLHUP | EPOLLERR | EPOLLRDHUP)) conn_read(srv, c);
+            if (!c->dead && (evs[i].events & EPOLLOUT)) conn_flush(c);
+        }
+        if (accept_ready) accept_all(srv);
+        return;
+    }
+#endif
+    /* poll(): one pollfd per connection, rebuilt every iteration */
+    size_t n = srv->nconns + 1;
+    if (n > srv->pcap) { srv->pcap = n * 2; srv->pfds = xrealloc(srv->pfds, srv->pcap * sizeof *srv->pfds); }
+    struct pollfd *pfds = srv->pfds;
+    pfds[0].fd = srv->listen_fd;
+    pfds[0].events = POLLIN;
+    pfds[0].revents = 0;
+    for (size_t i = 0; i < srv->nconns; i++) {
+        http_conn *c = srv->conns[i];
+        pfds[i + 1].fd = c->fd;
+        pfds[i + 1].events = POLLIN | (conn_pending(c) && !c->held ? POLLOUT : 0);
+        pfds[i + 1].revents = 0;
+    }
+    int rc = poll(pfds, (nfds_t)n, timeout_ms);
+    if (rc < 0 && errno != EINTR) { perror("poll"); *stop = 1; return; }
+    if (*stop || rc <= 0) return;
+    /* conns may grow during this pass (accept), so handle existing ones first */
+    size_t existing = srv->nconns;
+    for (size_t i = 0; i < existing; i++) {
+        http_conn *c = srv->conns[i];
+        short re = pfds[i + 1].revents;
+        if (re & (POLLIN | POLLHUP | POLLERR)) conn_read(srv, c);
+        if (!c->dead && (re & POLLOUT)) conn_flush(c);
+    }
+    if (pfds[0].revents & POLLIN) accept_all(srv);
+}
+
 void http_server_run(http_server *srv, volatile sig_atomic_t *stop) {
-    struct pollfd *pfds = NULL;
-    size_t pcap = 0;
+    poller_open(srv);
+    for (size_t i = 0; i < srv->nconns; i++) poller_add(srv, srv->conns[i]);
+    srv->running = 1;
     while (!*stop) {
-        size_t n = srv->nconns + 1;
-        if (n > pcap) { pcap = n * 2; pfds = xrealloc(pfds, pcap * sizeof *pfds); }
-        pfds[0].fd = srv->listen_fd;
-        pfds[0].events = POLLIN;
-        pfds[0].revents = 0;
-        for (size_t i = 0; i < srv->nconns; i++) {
-            http_conn *c = srv->conns[i];
-            pfds[i + 1].fd = c->fd;
-            pfds[i + 1].events = POLLIN | (conn_pending(c) ? POLLOUT : 0);
-            pfds[i + 1].revents = 0;
-        }
-        int rc = poll(pfds, (nfds_t)n, 1000);
-        if (rc < 0 && errno != EINTR) { perror("poll"); break; }
+        wait_events(srv, 1000, stop);
         if (*stop) break;
-        if (rc > 0) {
-            /* conns may grow during this pass (accept), so handle existing ones first */
-            size_t existing = srv->nconns;
-            for (size_t i = 0; i < existing; i++) {
-                http_conn *c = srv->conns[i];
-                short re = pfds[i + 1].revents;
-                if (re & (POLLIN | POLLHUP | POLLERR)) conn_read(srv, c);
-                if (!c->dead && (re & POLLOUT)) conn_flush(c);
-            }
-            if (pfds[0].revents & POLLIN) accept_all(srv);
-        }
         if (srv->tick) srv->tick(srv, srv->ctx);
         barrier(srv);
-        /* opportunistically flush everything queued this round (responses, SSE pushes) */
+        /* flush everything queued this round (responses, SSE pushes) */
         for (size_t i = 0; i < srv->nconns; i++) {
             http_conn *c = srv->conns[i];
             if (!c->dead && conn_pending(c)) conn_flush(c);
@@ -563,10 +693,11 @@ void http_server_run(http_server *srv, volatile sig_atomic_t *stop) {
                 process_input(srv, c);
                 if (!c->dead && conn_pending(c)) conn_flush(c);
             }
+            poller_want_write(srv, c, !c->dead && conn_pending(c) && !c->held);
         }
         reap(srv);
     }
-    free(pfds);
+    srv->running = 0;
 }
 
 void http_server_close(http_server *srv) {
@@ -585,4 +716,9 @@ void http_server_close(http_server *srv) {
     srv->nconns = 0;
     if (srv->listen_fd >= 0) close(srv->listen_fd);
     srv->listen_fd = -1;
+    if (srv->poll_fd >= 0) close(srv->poll_fd);
+    srv->poll_fd = -1;
+    free(srv->pfds);
+    srv->pfds = NULL;
+    srv->pcap = 0;
 }

@@ -1,6 +1,7 @@
 #ifndef MODX_HTTP_H
 #define MODX_HTTP_H
 
+#include <poll.h>
 #include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -72,6 +73,7 @@ struct http_conn {
     size_t send_left;
     int resume;        /* input left unprocessed while a file was streaming */
     char ip[64];       /* peer address */
+    int want_write;    /* registered for writability with kqueue / epoll */
     int held;          /* group commit: output waits for the durability barrier */
     size_t hold_mark;  /* out.len before the first held response */
     void *app;         /* application data bound to the connection (e.g. an SSE subscription);
@@ -101,6 +103,11 @@ struct http_server {
     int (*durable_pending)(void *dctx);
     int (*durable_commit)(void *dctx);
     void *durable_ctx;
+    int use_poll;                /* 1 = poll() even where kqueue / epoll exist */
+    int poll_fd;                 /* kqueue / epoll descriptor (-1 = poll()) */
+    struct pollfd *pfds;         /* poll() fallback set */
+    size_t pcap;
+    int running;
     int64_t commits;             /* barrier commits run */
     int64_t commit_failures;
     void *ctx;
@@ -129,7 +136,10 @@ long http_parse_request_need(const char *buf, size_t len, http_request *req, int
 void http_request_free(http_request *r);
 
 int http_server_listen(http_server *srv, const char *host, int port);
-/* Runs until *stop becomes non-zero. */
+/* "kqueue", "epoll" or "poll" (valid once the server runs). */
+const char *http_server_poller(const http_server *srv);
+/* Runs until *stop becomes non-zero. Uses kqueue (macOS / BSD) or epoll
+ * (Linux), poll() elsewhere or with use_poll / -DMODX_POLLER_POLL. */
 void http_server_run(http_server *srv, volatile sig_atomic_t *stop);
 void http_server_close(http_server *srv);
 

@@ -111,6 +111,7 @@ typedef struct {
 } conn;
 
 static long rows = 100000;
+static int idle = 0; /* extra connections that stay open and silent during the run */
 static const char *mode = "get";
 
 static int build_request(char *out, size_t cap, const char *m) {
@@ -171,6 +172,8 @@ static int run_requests(int nconns, double duration) {
         cs[i].fd = dial();
         if (cs[i].fd < 0) { fprintf(stderr, "loadgen: connect failed: %s\n", strerror(errno)); return 2; }
     }
+    for (int i = 0; i < idle; i++)
+        if (dial() < 0) { fprintf(stderr, "loadgen: idle connect failed: %s\n", strerror(errno)); return 2; }
     double t0 = now_s(), stop_at = t0 + duration;
     long done = 0;
     for (;;) {
@@ -218,9 +221,9 @@ static int run_requests(int nconns, double duration) {
     }
     double elapsed = now_s() - t0;
     qsort(lat.v, lat.n, sizeof *lat.v, cmpd);
-    printf("{\"mode\":\"%s\",\"conns\":%d,\"duration_s\":%.2f,\"requests\":%ld,\"errors\":%ld,\"non2xx\":%ld,"
+    printf("{\"mode\":\"%s\",\"idle\":%d,\"conns\":%d,\"duration_s\":%.2f,\"requests\":%ld,\"errors\":%ld,\"non2xx\":%ld,"
            "\"rps\":%.0f,\"p50_ms\":%.3f,\"p95_ms\":%.3f,\"p99_ms\":%.3f,\"max_ms\":%.3f}\n",
-           mode, nconns, elapsed, done, errors, non2xx, (double)done / elapsed, pct(&lat, 50), pct(&lat, 95),
+           mode, idle, nconns, elapsed, done, errors, non2xx, (double)done / elapsed, pct(&lat, 50), pct(&lat, 95),
            pct(&lat, 99), lat.n ? lat.v[lat.n - 1] : 0.0);
     return 0;
 }
@@ -364,6 +367,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(k, "--rows")) rows = atol(v);
         else if (!strcmp(k, "--subs")) subs = atoi(v);
         else if (!strcmp(k, "--writes")) writes = atoi(v);
+        else if (!strcmp(k, "--idle")) idle = atoi(v);
         else { fprintf(stderr, "loadgen: unknown option %s\n", k); return 2; }
     }
     struct rlimit rl;

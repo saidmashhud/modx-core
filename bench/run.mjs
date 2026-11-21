@@ -6,7 +6,7 @@
 // Every number is measured; nothing is estimated.
 import { spawn, execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
-import { tmpdir, cpus, totalmem, platform, release } from 'node:os';
+import { tmpdir, cpus, totalmem, platform, release, loadavg } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -14,8 +14,8 @@ const here = dirname(fileURLToPath(import.meta.url));
 const args = Object.fromEntries(process.argv.slice(2).reduce((acc, a, i, all) => (a.startsWith('--') ? [...acc, [a.slice(2), all[i + 1]]] : acc), []));
 const profile = args.profile || 'quick';
 const P = {
-  quick: { rows: 20000, dur: 3, conns: 32, subs: 200, writes: 50, pause: 1000, fill: 3 },
-  full: { rows: 100000, dur: 8, conns: 64, subs: 1000, writes: 200, pause: 3000, fill: 8 },
+  quick: { rows: 20000, dur: 3, conns: 32, subs: 200, writes: 50, pause: 1000, fill: 3, idle: 500 },
+  full: { rows: 100000, dur: 8, conns: 64, subs: 1000, writes: 200, pause: 3000, fill: 8, idle: 2000 },
 }[profile];
 if (!P) throw new Error('unknown profile ' + profile);
 const TODO = resolve(args.todo || join(here, '..', 'build', 'todo'));
@@ -31,7 +31,7 @@ function hardware() {
     if (platform() === 'darwin') disk = execFileSync('diskutil', ['info', '/']).toString().split('\n').filter((l) => /Solid State|Protocol|File System Personality/.test(l)).map((l) => l.trim().replace(/\s+/g, ' ')).join('; ');
     else disk = execFileSync('sh', ['-c', 'df -T / | tail -1']).toString().trim().replace(/\s+/g, ' ');
   } catch { /* */ }
-  return { cpu, cores: cpus().length, mem_gib: +(totalmem() / 2 ** 30).toFixed(1), os: `${platform()} ${release()}`, disk, node: process.version };
+  return { cpu, cores: cpus().length, mem_gib: +(totalmem() / 2 ** 30).toFixed(1), os: `${platform()} ${release()}`, disk, node: process.version, loadavg_at_start: loadavg().map((x) => +x.toFixed(1)) };
 }
 
 let proc = null, base = '', port = 0, startupLine = '';
@@ -65,7 +65,7 @@ function loadgen(extra) {
 }
 
 const want = (name) => !only || only.has(name);
-const results = { label, profile, params: P, hardware: hardware(), date: new Date().toISOString(), scenarios: {} };
+const results = { label, profile, params: P, poller: process.env.TODO_POLL === '1' ? 'poll' : 'native', hardware: hardware(), date: new Date().toISOString(), scenarios: {} };
 const root = mkdtempSync(join(tmpdir(), 'modx-bench-'));
 const dir = join(root, 'data');
 try {
@@ -83,6 +83,13 @@ try {
     const r = await loadgen(['--mode', mode, '--conns', String(P.conns), '--duration', String(P.dur), '--rows', String(P.rows)]);
     results.scenarios[mode] = { ...r, rss_kb: rssKb() };
     console.error(`  ${mode}: ${r.rps} req/s p50 ${r.p50_ms} p99 ${r.p99_ms} ms`);
+  }
+  if (want('idle')) {
+    // reads while 2000 other keep-alive connections sit idle (what poll() has to scan every iteration)
+    await sleep(P.pause);
+    const r = await loadgen(['--mode', 'get', '--conns', String(P.conns), '--duration', String(P.dur), '--rows', String(P.rows), '--idle', String(P.idle)]);
+    results.scenarios.idle = { ...r, rss_kb: rssKb() };
+    console.error(`  get + ${P.idle} idle: ${r.rps} req/s p50 ${r.p50_ms} p99 ${r.p99_ms} ms`);
   }
   if (want('sse')) {
     await sleep(P.pause);
@@ -126,8 +133,9 @@ try {
 mkdirSync(join(here, 'results'), { recursive: true });
 writeFileSync(join(here, 'results', `${label}.json`), JSON.stringify(results, null, 2) + '\n');
 const S = results.scenarios, h = results.hardware;
-const lines = [`### ${label} (${profile}: ${P.rows} rows, ${P.conns} conns, ${P.dur} s per run)`, '', `${h.cpu}, ${h.cores} cores, ${h.mem_gib} GiB, ${h.os}; disk: ${h.disk}`, '', '| scenario | req/s | p50 ms | p95 ms | p99 ms | RSS MiB |', '|---|---:|---:|---:|---:|---:|'];
+const lines = [`### ${label} (${profile}: ${P.rows} rows, ${P.conns} conns, ${P.dur} s per run)`, '', `${h.cpu}, ${h.cores} cores, ${h.mem_gib} GiB, ${h.os}; disk: ${h.disk}; load avg at start ${h.loadavg_at_start.join(" / ")}`, '', '| scenario | req/s | p50 ms | p95 ms | p99 ms | RSS MiB |', '|---|---:|---:|---:|---:|---:|'];
 for (const m of ['get', 'list', 'write', 'mixed']) if (S[m]) lines.push(`| ${m} | ${S[m].rps} | ${S[m].p50_ms} | ${S[m].p95_ms} | ${S[m].p99_ms} | ${(S[m].rss_kb / 1024).toFixed(1)} |`);
+if (S.idle) lines.push(`| get + ${S.idle.idle} idle conns | ${S.idle.rps} | ${S.idle.p50_ms} | ${S.idle.p95_ms} | ${S.idle.p99_ms} | ${(S.idle.rss_kb / 1024).toFixed(1)} |`);
 if (S.sse) lines.push(`| sse ${S.sse.subs} subs × ${S.sse.writes} writes (delivery) | ${S.sse.events_per_s} ev/s | ${S.sse.deliver_p50_ms} | ${S.sse.deliver_p95_ms} | ${S.sse.deliver_p99_ms} | ${(S.sse.rss_kb / 1024).toFixed(1)} |`);
 lines.push('');
 if (S.startup) lines.push(`- startup from snapshot (${S.startup.rows} rows): open ${S.startup.open_ms} ms, RSS ${(S.startup.rss_kb / 1024).toFixed(1)} MiB`);
