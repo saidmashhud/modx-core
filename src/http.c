@@ -339,8 +339,9 @@ static void serialize_response(http_server *srv, http_conn *c, const http_reques
         c->is_ws = 1;
         return;
     }
-    maybe_gzip(srv, req, resp);
     if (resp->sse) {
+        /* never gzip a stream: the catch-up body and every later event share one connection, and a
+           compressed first chunk followed by raw events breaks the client's decoder */
         sbuf_printf(&c->out,
                     "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n"
                     "Connection: keep-alive\r\nX-Accel-Buffering: no\r\n");
@@ -350,6 +351,7 @@ static void serialize_response(http_server *srv, http_conn *c, const http_reques
         c->is_sse = 1;
         return;
     }
+    maybe_gzip(srv, req, resp);
     int head = strcmp(req->method, "HEAD") == 0;
     int no_body = head || resp->status == 204 || resp->status == 304;
     int file = resp->file_fd >= 0;

@@ -49,11 +49,18 @@ async function api(method, path, body, headers = {}) {
 function sse(path, headers = {}) {
   const u = new URL(base + path);
   const events = [];
+  const st = { head: '' };
   let buf = '';
   const sock = net.connect(Number(u.port), u.hostname);
   sock.write(`GET ${u.pathname}${u.search} HTTP/1.1\r\nHost: ${u.host}\r\nAccept: text/event-stream\r\n${Object.entries(headers).map(([k, v]) => `${k}: ${v}\r\n`).join('')}\r\n`);
   sock.on('data', (d) => {
     buf += d;
+    if (!st.head) {
+      const h = buf.indexOf('\r\n\r\n');
+      if (h < 0) return;
+      st.head = buf.slice(0, h);
+      buf = buf.slice(h + 4);
+    }
     let i;
     while ((i = buf.indexOf('\n\n')) >= 0) {
       const block = buf.slice(0, i);
@@ -67,7 +74,7 @@ function sse(path, headers = {}) {
       if (ev.data) events.push(ev);
     }
   });
-  return { events, close: () => sock.destroy() };
+  return { events, st, close: () => sock.destroy() };
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -217,6 +224,7 @@ try {
     check(again.status === 304 && (await again.text()) === '', '304 Not Modified');
     const plain = await fetch(base + '/app.js', { headers: { 'Accept-Encoding': 'identity' } });
     check(!plain.headers.get('content-encoding') && plain.headers.get('vary') === 'Accept-Encoding', 'identity when not accepted');
+    const seqBefore = (await api('GET', '/api/bootstrap')).json.seq;
     for (let i = 0; i < 60; i++) await api('POST', '/api/todos', { title: `cache row ${i} with some text`, list: 'cache' });
     const st0 = (await api('GET', '/api/stats')).json;
     const l1 = await fetch(base + '/api/todos?list=cache', { headers: { 'Accept-Encoding': 'gzip' } });
@@ -229,6 +237,16 @@ try {
     const j3 = (await api('GET', '/api/todos?list=cache')).json;
     check(j3[0].title === 'changed', 'a write invalidates the cached list');
     for (const r of j3) await api('DELETE', `/api/todos/${r.id}`);
+    // a large catch-up must not be gzipped: later events on the same stream are plain text
+    const stream = sse('/api/events', { 'Last-Event-ID': String(seqBefore), 'Accept-Encoding': 'gzip' });
+    check(await until(() => stream.events.length >= 60), 'SSE catch-up with Accept-Encoding: gzip', stream.events.length);
+    check(stream.st.head && !/content-encoding/i.test(stream.st.head), 'SSE is never gzipped', stream.st.head);
+    const before = stream.events.length;
+    await api('POST', '/api/todos', { title: 'after catch-up', list: 'cache' });
+    check(await until(() => stream.events.length > before && JSON.parse(stream.events.at(-1).data).data?.title === 'after catch-up'), 'live event after a large catch-up parses', stream.events.at(-1));
+    stream.close();
+    const tail = (await api('GET', '/api/todos?list=cache')).json;
+    for (const r of tail ?? []) await api('DELETE', `/api/todos/${r.id}`);
   }
 
   section('WebSocket (RFC 6455)');
