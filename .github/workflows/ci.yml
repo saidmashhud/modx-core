@@ -69,7 +69,7 @@ jobs:
         with:
           node-version: 22
       - run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
-      - name: short benchmark profile (numbers are for trends only: shared CI runners)
+      - name: "short benchmark profile (numbers are for trends only: shared CI runners)"
         run: make bench-quick | tee bench-summary.md
       - uses: actions/upload-artifact@v4
         with:
