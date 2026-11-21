@@ -465,12 +465,14 @@ static int load_snapshot(mx_store *st, char *err, size_t errlen) {
     }
     json_free(root);
     if (st->hooks.on_apply) {
-        /* derived state (indexes) sees every loaded row once */
+        /* derived state sees every loaded row once (st->loading tells the hook) */
+        st->loading = 1;
         for (int c = 0; c < st->ncoll; c++) {
             hmap *m = &st->colls[c];
             for (size_t i = 0; i < m->cap; i++)
                 if (m->slots[i].key) st->hooks.on_apply(st->hooks.ctx, st, c, m->slots[i].key, NULL, m->slots[i].val);
         }
+        st->loading = 0;
     }
     return 0;
 }

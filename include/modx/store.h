@@ -147,6 +147,7 @@ struct mx_store {
     int64_t compact_threshold; /* bytes; journal is compacted when it grows past this */
     int recovered_truncated;   /* set when a torn/corrupt tail was cut on open */
     void *app;                 /* free for the application */
+    int loading;               /* 1 while on_apply sees the rows of the snapshot being loaded */
     /* stats */
     int64_t open_ms;           /* time db_open took (load + replay) */
     int64_t last_compact_ms;   /* duration of the last compaction (parent-side) */
