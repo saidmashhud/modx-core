@@ -6,6 +6,7 @@
  *   POST   /api/todos        {"title","list"?}          -> 201 row
  *   PUT    /api/todos/<id>   {"title"?,"done"?}         -> row
  *   DELETE /api/todos/<id>                              -> 204
+ *   GET    /api/bootstrap                               -> {"seq", "todos": [every row]}
  *   GET    /api/changes?since=<seq>                     -> [change, ...] or 410
  *   GET    /api/events                                  -> SSE (Last-Event-ID catch-up)
  *   GET    /api/ws                                      -> WebSocket: change feed + echo
@@ -230,6 +231,20 @@ static void handle(http_server *srv, http_conn *c, const http_request *req, http
         if (!a->admin) { reply_err(resp, 403, "forbidden"); return; }
         a->st->fault_syncs = 1; /* the next group commit fails */
         reply_json(resp, 200, "{\"ok\":true}");
+        return;
+    }
+    if (get && strcmp(p, "/api/bootstrap") == 0) {
+        /* seq first, rows after: a client applies changes with a larger seq on top */
+        size_t n;
+        const json **all = mx_store_all(a->st, C_TODOS, &n);
+        resp->content_type = "application/json; charset=utf-8";
+        sbuf_printf(&resp->body, "{\"seq\":%lld,\"todos\":[", (long long)a->st->seq);
+        for (size_t i = 0; i < n; i++) {
+            if (i) sbuf_putc(&resp->body, ',');
+            json_write(&resp->body, all[i]);
+        }
+        sbuf_puts(&resp->body, "]}");
+        free(all);
         return;
     }
     if (get && strcmp(p, "/api/changes") == 0) {

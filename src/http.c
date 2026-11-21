@@ -460,7 +460,12 @@ static void conn_flush(http_conn *c) {
         c->send_left -= (size_t)r;
         c->last_active = mono_ms();
     }
-    if (c->close_after_write) c->dead = 1;
+    if (c->close_after_write && !c->linger_until) {
+        /* lingering close: stop sending, keep reading (and discarding) for a moment, so a peer that is still
+         * sending (an oversized body, a WebSocket frame) reads our answer instead of a reset */
+        if (shutdown(c->fd, SHUT_WR) == 0) c->linger_until = mono_ms() + HTTP_LINGER_MS;
+        else c->dead = 1;
+    }
 }
 
 static void conn_read(http_server *srv, http_conn *c) {
@@ -486,7 +491,11 @@ static void conn_read(http_server *srv, http_conn *c) {
         }
         if (n == 0) { c->dead = 1; return; }
         c->last_active = mono_ms();
-        if (discard) continue;
+        if (c->linger_until || discard) { /* discarded, but still within the read budget */
+            if ((size_t)n >= budget) break;
+            budget -= (size_t)n;
+            continue;
+        }
         if (!c->req_start) c->req_start = c->last_active;
         c->in.len += (size_t)n;
         c->in.data[c->in.len] = 0;
@@ -542,6 +551,7 @@ static void timeouts(http_server *srv, int64_t now) {
         if (c->dead) continue;
         int pending = conn_pending(c) && !c->held;
         if (pending && c->out_since && now - c->out_since > wr) { c->dead = 1; srv->timeouts++; continue; }
+        if (c->linger_until) { if (now > c->linger_until) c->dead = 1; continue; }
         if (c->is_ws) { mx_ws_tick(srv, c, now); continue; }
         if (c->is_sse || c->close_after_write) continue;
         if (c->req_start && !c->held && !pending) {

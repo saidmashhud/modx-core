@@ -18,6 +18,7 @@
 #define HTTP_BODY_TIMEOUT_MS 60000     /* first byte of a request -> end of its body */
 #define HTTP_WRITE_TIMEOUT_MS 60000    /* pending output without progress */
 #define HTTP_DRAIN_MS 5000             /* graceful shutdown budget */
+#define HTTP_LINGER_MS 2000            /* after a final response: read and discard this long before closing */
 #define HTTP_SSE_MAX_BACKLOG (8 * 1024 * 1024)
 
 typedef struct {
@@ -81,6 +82,7 @@ struct http_conn {
     int64_t req_start; /* mono ms of the first byte of the request being received (0 = none) */
     int64_t out_since; /* mono ms output has been waiting / last write progress (0 = none) */
     int64_t requests;  /* requests served on this connection */
+    int64_t linger_until; /* lingering close: output done, input discarded until then (0 = no) */
     int is_ws;         /* WebSocket after a 101 */
     int ws_closing;    /* close frame sent */
     int ws_msg_op;     /* opcode of the message being reassembled (0 = none) */

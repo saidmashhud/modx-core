@@ -155,6 +155,8 @@ try {
   const ahead = sse('/api/events', { 'Last-Event-ID': '999' });
   check(await until(() => ahead.events.some((e) => e.event === 'reset')), 'reset when ahead');
   ahead.close();
+  const boot = await api('GET', '/api/bootstrap');
+  check(boot.json?.seq === 4 && boot.json.todos.length === 1, 'bootstrap', boot.json);
   const ch = await api('GET', '/api/changes?since=1');
   check(ch.status === 200 && ch.json.length === 3, '/changes since 1', ch.json);
   check((await api('GET', '/api/changes?since=99')).status === 410, '/changes 410');
