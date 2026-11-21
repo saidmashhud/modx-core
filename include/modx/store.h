@@ -62,7 +62,19 @@ enum {
 typedef struct {
     const char *name;
     unsigned flags;
+    /* Fields to index (NULL-terminated, may be NULL): mx_store_find looks
+     * rows up by the string value of such a field without a full scan. */
+    const char *const *index;
 } mx_coll_def;
+
+/* Secondary index of one field: value -> set of storage keys. */
+typedef struct mx_ixbucket mx_ixbucket;
+typedef struct {
+    int coll;
+    const char *field;
+    mx_ixbucket **slots;
+    size_t cap, count;
+} mx_index;
 
 /* One retained change. json is the public serialized change
  * ({"seq","entity","op","id","data","client_id"?,"ts"}), NULL for private
@@ -125,6 +137,8 @@ struct mx_store {
     int ncoll;
     const mx_coll_def *defs;
     hmap *colls;           /* ncoll maps */
+    mx_index *indexes;     /* from the collection definitions */
+    int nindexes;
     mx_change *ring;
     size_t ring_cap, ring_start, ring_len;
     mx_store_listener listener;
@@ -167,6 +181,15 @@ const json *mx_store_get(const mx_store *st, int coll, const char *key);
 size_t mx_store_count(const mx_store *st, int coll);
 /* Malloc'ed array of borrowed pointers (caller frees the array only). */
 const json **mx_store_all(const mx_store *st, int coll, size_t *n);
+
+/* Rows of coll whose string field equals value (borrowed pointers in a
+ * malloc'ed array; caller frees the array). Uses the index when the field is
+ * declared in mx_coll_def.index, else scans. Order is unspecified. */
+const json **mx_store_find(const mx_store *st, int coll, const char *field, const char *value, size_t *n);
+/* Number of rows mx_store_find would return (O(1) for indexed fields). */
+size_t mx_store_find_count(const mx_store *st, int coll, const char *field, const char *value);
+/* 1 when (coll, field) is indexed. */
+int mx_store_indexed(const mx_store *st, int coll, const char *field);
 
 /* Mutations: journal, apply in memory, record in the ring (not durable until
  * mx_store_sync). put takes ownership of obj (which needs a string "id"); the

@@ -16,7 +16,8 @@
  * Environment: TODO_HOST (127.0.0.1), TODO_PORT (8080, 0 = any), TODO_DATA
  * (./todo-data), TODO_STATIC, TODO_SEED=<n> (seed n rows into an empty store),
  * TODO_COMPACT_BYTES, TODO_MAX_CONNS (4096), TODO_POLL=1 (poll() instead of
- * kqueue / epoll), TODO_ADMIN=1. */
+ * kqueue / epoll), TODO_GZIP_MIN (1024; 0 = no gzip), TODO_CACHE (1; 0 = no
+ * list response cache), TODO_ADMIN=1. */
 
 #include <errno.h>
 #include <signal.h>
@@ -26,6 +27,7 @@
 #include <sys/resource.h>
 #include <unistd.h>
 
+#include "modx/cache.h"
 #include "modx/http.h"
 #include "modx/json.h"
 #include "modx/sse.h"
@@ -34,11 +36,14 @@
 #include "modx/util.h"
 
 enum { C_TODOS, C_NCOLL };
-static const mx_coll_def COLLS[C_NCOLL] = { { "todos", 0 } };
+static const char *const TODO_INDEX[] = { "list", NULL };
+static const mx_coll_def COLLS[C_NCOLL] = { { "todos", 0, TODO_INDEX } };
 
 typedef struct {
     mx_store *st;
     mx_sse sse;
+    mx_cache cache;    /* list responses, valid for the seq they were built at */
+    int use_cache;
     const char *static_dir;
     int admin;
 } app;
@@ -77,16 +82,18 @@ static void list_todos(app *a, const http_request *req, http_response *resp) {
     const char *lim = http_req_query(req, "limit");
     long limit = lim ? strtol(lim, NULL, 10) : 100;
     if (limit <= 0 || limit > 1000) limit = 100;
-    size_t n;
-    const json **all = mx_store_all(a->st, C_TODOS, &n);
-    size_t k = 0;
-    for (size_t i = 0; i < n; i++) {
-        const char *l = json_get_str(all[i], "list");
-        if (!list || (l && strcmp(l, list) == 0)) all[k++] = all[i];
-    }
+    resp->content_type = "application/json; charset=utf-8";
+    char key[160];
+    snprintf(key, sizeof key, "list|%s|%ld", list ? list : "", limit);
+    size_t clen;
+    const char *hit = a->use_cache ? mx_cache_get(&a->cache, key, a->st->seq, &clen) : NULL;
+    if (hit) { sbuf_put(&resp->body, hit, clen); return; }
+    size_t k;
+    /* one list: the index; everything: all rows */
+    const json **all = list ? mx_store_find(a->st, C_TODOS, "list", list, &k) : mx_store_all(a->st, C_TODOS, &k);
     qsort(all, k, sizeof *all, cmp_updated_desc);
     if (k > (size_t)limit) k = (size_t)limit;
-    resp->content_type = "application/json; charset=utf-8";
+    size_t start = resp->body.len;
     sbuf_putc(&resp->body, '[');
     for (size_t i = 0; i < k; i++) {
         if (i) sbuf_putc(&resp->body, ',');
@@ -94,6 +101,7 @@ static void list_todos(app *a, const http_request *req, http_response *resp) {
     }
     sbuf_putc(&resp->body, ']');
     free(all);
+    if (a->use_cache) mx_cache_put(&a->cache, key, a->st->seq, resp->body.data + start, resp->body.len - start);
 }
 
 static json *parse_body(const http_request *req) {
@@ -184,14 +192,19 @@ static void handle(http_server *srv, http_conn *c, const http_request *req, http
     if (get && strcmp(p, "/api/health") == 0) { reply_json(resp, 200, "{\"ok\":true}"); return; }
     if (get && strcmp(p, "/api/events") == 0) { open_events(a, c, req, resp); return; }
     if (get && strcmp(p, "/api/stats") == 0) {
+        mx_store *st = a->st;
         resp->content_type = "application/json; charset=utf-8";
-        sbuf_printf(&resp->body,
-                    "{\"seq\":%lld,\"rows\":%zu,\"journal_bytes\":%lld,\"open_ms\":%lld,\"last_compact_ms\":%lld,"
-                    "\"compactions\":%lld,\"compacting\":%s,\"fsyncs\":%lld,\"max_batch\":%lld,\"poller\":\"%s\",\"conns\":%zu,\"peak_conns\":%zu,\"streams\":%zu,\"max_rss_kb\":%ld}",
-                    (long long)a->st->seq, mx_store_count(a->st, C_TODOS), (long long)a->st->journal_size,
-                    (long long)a->st->open_ms, (long long)a->st->last_compact_ms, (long long)a->st->compactions,
-                    a->st->compact_pid > 0 ? "true" : "false", (long long)a->st->fsyncs, (long long)a->st->max_batch,
-                    http_server_poller(srv), srv->nconns, srv->nconns_peak, mx_sse_count(&a->sse), rss_kb());
+        sbuf *o = &resp->body;
+        sbuf_printf(o, "{\"seq\":%lld,\"rows\":%zu,\"journal_bytes\":%lld,\"open_ms\":%lld,", (long long)st->seq,
+                    mx_store_count(st, C_TODOS), (long long)st->journal_size, (long long)st->open_ms);
+        sbuf_printf(o, "\"last_compact_ms\":%lld,\"compactions\":%lld,\"compacting\":%s,", (long long)st->last_compact_ms,
+                    (long long)st->compactions, st->compact_pid > 0 ? "true" : "false");
+        sbuf_printf(o, "\"fsyncs\":%lld,\"max_batch\":%lld,\"poller\":\"%s\",", (long long)st->fsyncs,
+                    (long long)st->max_batch, http_server_poller(srv));
+        sbuf_printf(o, "\"gzip_in\":%lld,\"gzip_out\":%lld,\"cache_hits\":%lld,\"cache_misses\":%lld,",
+                    (long long)srv->gzip_in, (long long)srv->gzip_out, (long long)a->cache.hits, (long long)a->cache.misses);
+        sbuf_printf(o, "\"conns\":%zu,\"peak_conns\":%zu,\"streams\":%zu,\"max_rss_kb\":%ld}", srv->nconns,
+                    srv->nconns_peak, mx_sse_count(&a->sse), rss_kb());
         return;
     }
     if (strcmp(p, "/api/compact") == 0 && strcmp(m, "POST") == 0) {
@@ -326,6 +339,9 @@ int main(void) {
     srv.listen_fd = -1;
     srv.max_conns = (size_t)env_long("TODO_MAX_CONNS", 4096);
     srv.use_poll = env_long("TODO_POLL", 0) == 1;
+    srv.gzip_min = (size_t)env_long("TODO_GZIP_MIN", 1024); /* 0 = off */
+    a.use_cache = env_long("TODO_CACHE", 1) == 1;
+    mx_cache_init(&a.cache, 8 << 20);
     if (http_server_listen(&srv, host, (int)port) != 0) {
         fprintf(stderr, "todo: cannot listen on %s:%ld: %s\n", host, port, strerror(errno));
         return 1;
@@ -348,5 +364,6 @@ int main(void) {
     http_server_close(&srv);
     int rc = mx_store_sync(a.st) == 0 ? 0 : 1;
     mx_store_close(a.st);
+    mx_cache_free(&a.cache);
     return rc;
 }

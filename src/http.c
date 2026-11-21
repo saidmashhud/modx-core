@@ -1,4 +1,5 @@
 #include "modx/http.h"
+#include "modx/gzip.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -10,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -295,7 +297,34 @@ static void write_simple_error(http_conn *c, int status) {
     c->close_after_write = 1;
 }
 
-static void serialize_response(http_conn *c, const http_request *req, http_response *resp) {
+static int has_header(const sbuf *h, const char *name) {
+    size_t n = strlen(name);
+    for (size_t i = 0; h->data && i + n < h->len; i++)
+        if ((i == 0 || h->data[i - 1] == '\n') && strncasecmp(h->data + i, name, n) == 0 && h->data[i + n] == ':') return 1;
+    return 0;
+}
+
+/* gzip a buffered response when the client takes it and it is worth it. */
+static void maybe_gzip(http_server *srv, const http_request *req, http_response *resp) {
+    if (!srv->gzip_min || resp->file_fd >= 0 || resp->status != 200 || strcmp(req->method, "HEAD") == 0) return;
+    if (!mx_compressible(resp->content_type) || has_header(&resp->headers, "content-encoding")) return;
+    sbuf_puts(&resp->headers, "Vary: Accept-Encoding\r\n");
+    if (resp->body.len < srv->gzip_min || !mx_accepts_gzip(http_req_header(req, "accept-encoding"))) return;
+    sbuf z;
+    sbuf_init(&z);
+    if (mx_gzip(resp->body.data, resp->body.len, &z, srv->gzip_level) == 0 && z.len < resp->body.len) {
+        srv->gzip_in += (int64_t)resp->body.len;
+        srv->gzip_out += (int64_t)z.len;
+        sbuf_free(&resp->body);
+        resp->body = z;
+        sbuf_puts(&resp->headers, "Content-Encoding: gzip\r\n");
+    } else {
+        sbuf_free(&z);
+    }
+}
+
+static void serialize_response(http_server *srv, http_conn *c, const http_request *req, http_response *resp) {
+    maybe_gzip(srv, req, resp);
     if (resp->sse) {
         sbuf_printf(&c->out,
                     "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n"
@@ -312,7 +341,8 @@ static void serialize_response(http_conn *c, const http_request *req, http_respo
     sbuf_printf(&c->out, "HTTP/1.1 %d %s\r\n", resp->status, http_status_text(resp->status));
     if (resp->content_type && resp->status != 204)
         sbuf_printf(&c->out, "Content-Type: %s\r\n", resp->content_type);
-    if (resp->status != 204) sbuf_printf(&c->out, "Content-Length: %zu\r\n", file ? resp->file_len : resp->body.len);
+    if (resp->status != 204 && resp->status != 304)
+        sbuf_printf(&c->out, "Content-Length: %zu\r\n", file ? resp->file_len : resp->body.len);
     sbuf_printf(&c->out, "Connection: %s\r\n", req->keep_alive ? "keep-alive" : "close");
     if (resp->headers.len) sbuf_put(&c->out, resp->headers.data, resp->headers.len);
     sbuf_puts(&c->out, "\r\n");
@@ -367,7 +397,7 @@ static void process_input(http_server *srv, http_conn *c) {
             c->held = 1;
             c->hold_mark = c->out.len;
         }
-        serialize_response(c, &req, &resp);
+        serialize_response(srv, c, &req, &resp);
         if (resp.file_fd >= 0) close(resp.file_fd);
         sbuf_free(&resp.body);
         sbuf_free(&resp.headers);

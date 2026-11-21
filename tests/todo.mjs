@@ -161,6 +161,31 @@ try {
     for (const r of [...rs, more]) await api('DELETE', `/api/todos/${r.json.id}`);
   }
 
+  section('gzip, ETag, list cache');
+  {
+    const js = await fetch(base + '/app.js', { headers: { 'Accept-Encoding': 'gzip' } });
+    const body = await js.text();
+    check(js.headers.get('content-encoding') === 'gzip' && body === 'console.log(1);'.repeat(200), 'static gzip', js.headers.get('content-encoding'));
+    const tag = js.headers.get('etag');
+    check(tag && tag.startsWith('W/"'), 'etag', tag);
+    const again = await fetch(base + '/app.js', { headers: { 'If-None-Match': tag } });
+    check(again.status === 304 && (await again.text()) === '', '304 Not Modified');
+    const plain = await fetch(base + '/app.js', { headers: { 'Accept-Encoding': 'identity' } });
+    check(!plain.headers.get('content-encoding') && plain.headers.get('vary') === 'Accept-Encoding', 'identity when not accepted');
+    for (let i = 0; i < 60; i++) await api('POST', '/api/todos', { title: `cache row ${i} with some text`, list: 'cache' });
+    const st0 = (await api('GET', '/api/stats')).json;
+    const l1 = await fetch(base + '/api/todos?list=cache', { headers: { 'Accept-Encoding': 'gzip' } });
+    const j1 = await l1.json();
+    check(l1.headers.get('content-encoding') === 'gzip' && j1.length === 60, 'api gzip');
+    const j2 = (await api('GET', '/api/todos?list=cache')).json;
+    const st1 = (await api('GET', '/api/stats')).json;
+    check(JSON.stringify(j1) === JSON.stringify(j2) && st1.cache_hits > st0.cache_hits, 'second list served from the cache', st1);
+    await api('PUT', `/api/todos/${j1[0].id}`, { title: 'changed' });
+    const j3 = (await api('GET', '/api/todos?list=cache')).json;
+    check(j3[0].title === 'changed', 'a write invalidates the cached list');
+    for (const r of j3) await api('DELETE', `/api/todos/${r.id}`);
+  }
+
   section('connection limit');
   {
     // TODO_MAX_CONNS is 4096 by default; open 300 idle keep-alive sockets and still get served

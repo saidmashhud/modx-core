@@ -10,6 +10,7 @@ int main(void) {
     test_http_all();
     test_store_all();
     test_timer_all();
+    test_gzip_all();
     fprintf(stderr, "\nunit: %d checks, %d failed\n", t_checks, t_failures);
     return t_failures ? 1 : 0;
 }

@@ -6,11 +6,17 @@ STD      := -std=c11 -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE
 WARN     := -Wall -Wextra -Werror
 ALL_CFLAGS  := $(OPT) $(SAN) $(STD) $(WARN) -Iinclude $(CFLAGS)
 ALL_LDFLAGS := $(SAN) $(LDFLAGS)
+ZLIB     ?= 1
+ifeq ($(ZLIB),1)
+LDLIBS   += -lz
+else
+CFLAGS   += -DMODX_NO_ZLIB
+endif
 LDLIBS   += -lm
 
 BUILD    ?= build
 SRC      := src/util.c src/json.c src/crypto.c src/http.c src/sse.c src/static.c src/ot.c \
-            src/session.c src/store.c src/timer.c
+            src/session.c src/store.c src/timer.c src/cache.c src/gzip.c
 OBJ      := $(SRC:src/%.c=$(BUILD)/%.o)
 LIB      := $(BUILD)/libmodxcore.a
 TEST_SRC := $(wildcard tests/test_*.c)

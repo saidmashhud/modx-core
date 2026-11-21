@@ -103,6 +103,9 @@ struct http_server {
     int (*durable_pending)(void *dctx);
     int (*durable_commit)(void *dctx);
     void *durable_ctx;
+    size_t gzip_min;             /* gzip compressible responses of at least this many bytes (0 = off) */
+    int gzip_level;              /* 1..9, 0 = 6 */
+    int64_t gzip_in, gzip_out;   /* bytes before / after compression */
     int use_poll;                /* 1 = poll() even where kqueue / epoll exist */
     int poll_fd;                 /* kqueue / epoll descriptor (-1 = poll()) */
     struct pollfd *pfds;         /* poll() fallback set */

@@ -106,6 +106,156 @@ int hmap_del(hmap *m, const char *key) {
     return 1;
 }
 
+/* ---------------- secondary indexes ----------------
+ * value -> bucket (an open-addressing set of storage keys). Buckets are
+ * found by open addressing on the value, keys inside a bucket likewise. */
+
+struct mx_ixbucket {
+    char *value;
+    char **keys;      /* open addressing; NULL = empty */
+    size_t cap, count;
+};
+
+static size_t set_find(char **keys, size_t cap, const char *k) {
+    size_t mask = cap - 1, i = (size_t)hash_str(k) & mask;
+    while (keys[i] && strcmp(keys[i], k) != 0) i = (i + 1) & mask;
+    return i;
+}
+
+static void bucket_add(mx_ixbucket *b, const char *key) {
+    if ((b->count + 1) * 4 >= b->cap * 3) {
+        size_t ncap = b->cap ? b->cap * 2 : 8;
+        char **nk = xcalloc(ncap, sizeof *nk);
+        for (size_t i = 0; i < b->cap; i++)
+            if (b->keys[i]) nk[set_find(nk, ncap, b->keys[i])] = b->keys[i];
+        free(b->keys);
+        b->keys = nk;
+        b->cap = ncap;
+    }
+    size_t i = set_find(b->keys, b->cap, key);
+    if (b->keys[i]) return;
+    b->keys[i] = xstrdup(key);
+    b->count++;
+}
+
+static void bucket_remove(mx_ixbucket *b, const char *key) {
+    if (!b->cap) return;
+    size_t mask = b->cap - 1, i = set_find(b->keys, b->cap, key);
+    if (!b->keys[i]) return;
+    free(b->keys[i]);
+    b->keys[i] = NULL;
+    b->count--;
+    size_t j = i;
+    for (;;) { /* backward-shift deletion */
+        j = (j + 1) & mask;
+        if (!b->keys[j]) break;
+        size_t home = (size_t)hash_str(b->keys[j]) & mask;
+        int move = (i <= j) ? (home <= i || home > j) : (home <= i && home > j);
+        if (move) { b->keys[i] = b->keys[j]; b->keys[j] = NULL; i = j; }
+    }
+}
+
+static size_t ix_slot(const mx_index *ix, const char *value) {
+    size_t mask = ix->cap - 1, i = (size_t)hash_str(value) & mask;
+    while (ix->slots[i] && strcmp(ix->slots[i]->value, value) != 0) i = (i + 1) & mask;
+    return i;
+}
+
+static mx_ixbucket *ix_get(const mx_index *ix, const char *value) {
+    if (!ix->cap) return NULL;
+    return ix->slots[ix_slot(ix, value)];
+}
+
+static mx_ixbucket *ix_get_or_add(mx_index *ix, const char *value) {
+    if ((ix->count + 1) * 4 >= ix->cap * 3) {
+        size_t ncap = ix->cap ? ix->cap * 2 : 64;
+        mx_ixbucket **old = ix->slots;
+        size_t ocap = ix->cap;
+        ix->slots = xcalloc(ncap, sizeof *ix->slots);
+        ix->cap = ncap;
+        for (size_t i = 0; i < ocap; i++)
+            if (old[i]) ix->slots[ix_slot(ix, old[i]->value)] = old[i];
+        free(old);
+    }
+    size_t i = ix_slot(ix, value);
+    if (!ix->slots[i]) {
+        ix->slots[i] = xcalloc(1, sizeof **ix->slots);
+        ix->slots[i]->value = xstrdup(value);
+        ix->count++;
+    }
+    return ix->slots[i];
+}
+
+/* Empty buckets are kept (values usually come back); freed with the index. */
+static void ix_free(mx_index *ix) {
+    for (size_t i = 0; i < ix->cap; i++) {
+        mx_ixbucket *b = ix->slots[i];
+        if (!b) continue;
+        for (size_t k = 0; k < b->cap; k++) free(b->keys[k]);
+        free(b->keys);
+        free(b->value);
+        free(b);
+    }
+    free(ix->slots);
+}
+
+/* Keep every index of coll in line with a row change (old -> row, either NULL). */
+static void ix_update(mx_store *st, int coll, const char *key, const json *old, const json *row) {
+    for (int i = 0; i < st->nindexes; i++) {
+        mx_index *ix = &st->indexes[i];
+        if (ix->coll != coll) continue;
+        const char *a = old ? json_get_str(old, ix->field) : NULL;
+        const char *b = row ? json_get_str(row, ix->field) : NULL;
+        if (a && b && strcmp(a, b) == 0) continue;
+        if (a) { mx_ixbucket *bk = ix_get(ix, a); if (bk) bucket_remove(bk, key); }
+        if (b) bucket_add(ix_get_or_add(ix, b), key);
+    }
+}
+
+static const mx_index *ix_for(const mx_store *st, int coll, const char *field) {
+    for (int i = 0; i < st->nindexes; i++)
+        if (st->indexes[i].coll == coll && strcmp(st->indexes[i].field, field) == 0) return &st->indexes[i];
+    return NULL;
+}
+
+int mx_store_indexed(const mx_store *st, int coll, const char *field) { return ix_for(st, coll, field) != NULL; }
+
+const json **mx_store_find(const mx_store *st, int coll, const char *field, const char *value, size_t *n) {
+    *n = 0;
+    if (coll < 0 || coll >= st->ncoll || !field || !value) return xmalloc(sizeof(json *));
+    const mx_index *ix = ix_for(st, coll, field);
+    if (ix) {
+        const mx_ixbucket *b = ix_get(ix, value);
+        const json **out = xmalloc(((b && b->count) ? b->count : 1) * sizeof *out);
+        if (b)
+            for (size_t i = 0; i < b->cap; i++)
+                if (b->keys[i]) {
+                    const json *r = hmap_get(&st->colls[coll], b->keys[i]);
+                    if (r) out[(*n)++] = r;
+                }
+        return out;
+    }
+    const hmap *m = &st->colls[coll];
+    const json **out = xmalloc((m->count ? m->count : 1) * sizeof *out);
+    for (size_t i = 0; i < m->cap; i++) {
+        if (!m->slots[i].key) continue;
+        const char *v = json_get_str(m->slots[i].val, field);
+        if (v && strcmp(v, value) == 0) out[(*n)++] = m->slots[i].val;
+    }
+    return out;
+}
+
+size_t mx_store_find_count(const mx_store *st, int coll, const char *field, const char *value) {
+    const mx_index *ix = coll >= 0 && coll < st->ncoll && field && value ? ix_for(st, coll, field) : NULL;
+    if (ix) {
+        const mx_ixbucket *b = ix_get(ix, value);
+        return b ? b->count : 0;
+    }
+    size_t n;
+    free(mx_store_find(st, coll, field, value, &n));
+    return n;
+}
+
 /* ---------------- file helpers ---------------- */
 
 static char *path_join(const char *a, const char *b) {
@@ -247,6 +397,7 @@ static char *key_for(const mx_store *st, int coll, const char *id, const json *r
 static void apply(mx_store *st, int coll, const char *key, json *row) {
     hmap *m = &st->colls[coll];
     json *old = row ? hmap_swap(m, key, row) : hmap_take(m, key);
+    if (st->nindexes) ix_update(st, coll, key, old && old->type == JSON_OBJECT ? old : NULL, row);
     if (st->hooks.on_apply) st->hooks.on_apply(st->hooks.ctx, st, coll, key, old, row);
     json_free(old);
 }
@@ -305,7 +456,9 @@ static int load_snapshot(mx_store *st, char *err, size_t errlen) {
                 if (obj->type != JSON_OBJECT || !id) continue;
                 char *key = key_for(st, c, id, NULL, obj);
                 v->items[k] = json_null(); /* steal the object out of the parsed tree */
-                hmap_put(&st->colls[c], key, obj);
+                json *prev = hmap_swap(&st->colls[c], key, obj);
+                if (st->nindexes) ix_update(st, c, key, prev, obj);
+                json_free(prev);
                 free(key);
             }
         }
@@ -417,6 +570,15 @@ mx_store *mx_store_open(const char *dir, const mx_coll_def *defs, int ncoll, siz
     st->ncoll = ncoll;
     st->colls = xcalloc((size_t)(ncoll ? ncoll : 1), sizeof *st->colls);
     for (int i = 0; i < ncoll; i++) hmap_init(&st->colls[i]);
+    for (int i = 0; i < ncoll; i++)
+        for (const char *const *f = defs[i].index; f && *f; f++) st->nindexes++;
+    st->indexes = xcalloc((size_t)(st->nindexes ? st->nindexes : 1), sizeof *st->indexes);
+    for (int i = 0, k = 0; i < ncoll; i++)
+        for (const char *const *f = defs[i].index; f && *f; f++) {
+            st->indexes[k].coll = i;
+            st->indexes[k].field = *f;
+            k++;
+        }
     st->ring_cap = ring_cap;
     st->ring = xcalloc(ring_cap ? ring_cap : 1, sizeof *st->ring);
     st->compact_threshold = 4 * 1024 * 1024;
@@ -463,6 +625,8 @@ void mx_store_close(mx_store *st) {
     }
     for (size_t i = 0; i < st->ring_len; i++) change_free(st, &st->ring[(st->ring_start + i) % st->ring_cap]);
     for (int i = 0; i < st->ncoll; i++) hmap_free(&st->colls[i]);
+    for (int i = 0; i < st->nindexes; i++) ix_free(&st->indexes[i]);
+    free(st->indexes);
     free(st->colls);
     free(st->ring);
     free(st->dir);

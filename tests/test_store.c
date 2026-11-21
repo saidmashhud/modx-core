@@ -13,12 +13,13 @@
 #include "test_util.h"
 
 enum { T_ITEMS, T_LABELS, T_SECRETS, T_USERS, T_BULK, T_NCOLL };
+static const char *const ITEM_INDEX[] = { "tag", NULL };
 static const mx_coll_def DEFS[T_NCOLL] = {
-    { "items", 0 },
-    { "labels", 0 },
-    { "secrets", MX_COLL_PRIVATE },
-    { "users", MX_COLL_REDACT },
-    { "bulk", MX_COLL_PRIVATE | MX_COLL_NO_RING },
+    { "items", 0, ITEM_INDEX },
+    { "labels", 0, NULL },
+    { "secrets", MX_COLL_PRIVATE, NULL },
+    { "users", MX_COLL_REDACT, NULL },
+    { "bulk", MX_COLL_PRIVATE | MX_COLL_NO_RING, NULL },
 };
 
 /* users rows live per group: key "<group>|<id>", the journal remembers the group */
@@ -472,6 +473,70 @@ static void t_background_compaction(void) {
     rm_rf(dir);
 }
 
+static json *tagged(const char *id, const char *tag) {
+    json *o = item(id, 1);
+    if (tag) json_set(o, "tag", json_str(tag));
+    return o;
+}
+
+static int has_id(const json **rows, size_t n, const char *id) {
+    for (size_t i = 0; i < n; i++)
+        if (strcmp(json_get_str(rows[i], "id"), id) == 0) return 1;
+    return 0;
+}
+
+static void t_indexes(void) {
+    char *dir = make_tmpdir();
+    mx_store *st = open_st(dir, 100);
+    CHECK(mx_store_indexed(st, T_ITEMS, "tag") && !mx_store_indexed(st, T_ITEMS, "n"));
+    mx_store_put(st, T_ITEMS, tagged("a", "red"), NULL);
+    mx_store_put(st, T_ITEMS, tagged("b", "red"), NULL);
+    mx_store_put(st, T_ITEMS, tagged("c", "blue"), NULL);
+    mx_store_put(st, T_ITEMS, tagged("d", NULL), NULL);
+    size_t n;
+    const json **r = mx_store_find(st, T_ITEMS, "tag", "red", &n);
+    CHECK(n == 2 && has_id(r, n, "a") && has_id(r, n, "b"));
+    free(r);
+    CHECK(mx_store_find_count(st, T_ITEMS, "tag", "blue") == 1);
+    CHECK(mx_store_find_count(st, T_ITEMS, "tag", "green") == 0);
+    /* value change moves the key, delete removes it, same value is a no-op */
+    mx_store_put(st, T_ITEMS, tagged("a", "blue"), NULL);
+    mx_store_put(st, T_ITEMS, tagged("c", "blue"), NULL);
+    mx_store_del(st, T_ITEMS, "b", NULL);
+    CHECK(mx_store_find_count(st, T_ITEMS, "tag", "red") == 0);
+    r = mx_store_find(st, T_ITEMS, "tag", "blue", &n);
+    CHECK(n == 2 && has_id(r, n, "a") && has_id(r, n, "c"));
+    free(r);
+    /* a row losing the field leaves the index */
+    mx_store_put(st, T_ITEMS, tagged("c", NULL), NULL);
+    CHECK(mx_store_find_count(st, T_ITEMS, "tag", "blue") == 1);
+    /* unindexed fields scan */
+    r = mx_store_find(st, T_LABELS, "tag", "blue", &n);
+    CHECK(n == 0);
+    free(r);
+    mx_store_put(st, T_LABELS, tagged("l1", "blue"), NULL);
+    CHECK(mx_store_find_count(st, T_LABELS, "tag", "blue") == 1);
+    /* many rows in one bucket, then most removed */
+    char id[16];
+    for (int i = 0; i < 1000; i++) { snprintf(id, sizeof id, "m%d", i); mx_store_put(st, T_ITEMS, tagged(id, "many"), NULL); }
+    for (int i = 0; i < 1000; i += 3) { snprintf(id, sizeof id, "m%d", i); mx_store_del(st, T_ITEMS, id, NULL); }
+    CHECK(mx_store_find_count(st, T_ITEMS, "tag", "many") == 666);
+    r = mx_store_find(st, T_ITEMS, "tag", "many", &n);
+    CHECK(n == 666 && has_id(r, n, "m1") && !has_id(r, n, "m3"));
+    free(r);
+    mx_store_sync(st);
+    mx_store_close(st);
+    /* rebuilt from the journal, then from a snapshot */
+    st = open_st(dir, 100);
+    CHECK(mx_store_find_count(st, T_ITEMS, "tag", "many") == 666 && mx_store_find_count(st, T_ITEMS, "tag", "blue") == 1);
+    CHECK(mx_store_compact(st) == 0);
+    mx_store_close(st);
+    st = open_st(dir, 100);
+    CHECK(mx_store_find_count(st, T_ITEMS, "tag", "many") == 666 && mx_store_find_count(st, T_ITEMS, "tag", "red") == 0);
+    mx_store_close(st);
+    rm_rf(dir);
+}
+
 void test_store_all(void) {
     RUN(t_hmap);
     RUN(t_append_reload);
@@ -481,4 +546,5 @@ void test_store_all(void) {
     RUN(t_ring_window);
     RUN(t_flags_hooks);
     RUN(t_background_compaction);
+    RUN(t_indexes);
 }

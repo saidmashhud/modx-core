@@ -61,10 +61,13 @@ int static_path_safe(const char *path) {
     return 1;
 }
 
+static struct stat g_last; /* stat of the file load_file read last (single-threaded server) */
+
 static int load_file(const char *path, sbuf *out, int *is_dir) {
     struct stat st;
     *is_dir = 0;
     if (stat(path, &st) != 0) return -1;
+    g_last = st;
     if (S_ISDIR(st.st_mode)) { *is_dir = 1; return -1; }
     if (!S_ISREG(st.st_mode)) return -1;
     int fd = open(path, O_RDONLY);
@@ -78,6 +81,28 @@ static int load_file(const char *path, sbuf *out, int *is_dir) {
         sbuf_put(out, buf, (size_t)n);
     }
     close(fd);
+    return 0;
+}
+
+/* Weak validator from size + mtime: adds ETag, answers 304 (returns 1) when
+ * If-None-Match already names it. */
+static int etag(const http_request *req, http_response *resp) {
+    char tag[64];
+#ifdef __APPLE__
+    long long mt = (long long)g_last.st_mtimespec.tv_sec * 1000000000LL + g_last.st_mtimespec.tv_nsec;
+#else
+    long long mt = (long long)g_last.st_mtim.tv_sec * 1000000000LL + g_last.st_mtim.tv_nsec;
+#endif
+    snprintf(tag, sizeof tag, "W/\"%llx-%llx\"", (unsigned long long)g_last.st_size, (unsigned long long)mt);
+    sbuf_printf(&resp->headers, "ETag: %s\r\n", tag);
+    const char *inm = http_req_header(req, "if-none-match");
+    if (inm && (strstr(inm, tag) || strstr(inm, tag + 2) || strcmp(inm, "*") == 0)) {
+        resp->status = 304;
+        resp->body.len = 0;
+        if (resp->body.data) resp->body.data[0] = 0;
+        resp->content_type = NULL;
+        return 1;
+    }
     return 0;
 }
 
@@ -131,6 +156,7 @@ void static_serve(const char *root, const http_request *req, http_response *resp
             not_found(resp);
             return;
         }
+        if (etag(req, resp)) { sbuf_free(&path); return; }
         resp->status = 200;
         resp->content_type = static_mime_type(served);
         sbuf_puts(&resp->headers, "Cache-Control: no-cache\r\n");
@@ -139,6 +165,7 @@ void static_serve(const char *root, const http_request *req, http_response *resp
     }
 ok:
     served = path.data;
+    if (etag(req, resp)) { sbuf_free(&path); return; }
     resp->status = 200;
     resp->content_type = static_mime_type(served);
     if (strstr(served, "/assets/")) sbuf_puts(&resp->headers, "Cache-Control: public, max-age=31536000, immutable\r\n");
