@@ -16,7 +16,7 @@ LDLIBS   += -lm
 
 BUILD    ?= build
 SRC      := src/util.c src/json.c src/crypto.c src/http.c src/sse.c src/static.c src/ot.c \
-            src/session.c src/store.c src/timer.c src/cache.c src/gzip.c
+            src/session.c src/store.c src/timer.c src/cache.c src/gzip.c src/ws.c
 OBJ      := $(SRC:src/%.c=$(BUILD)/%.o)
 LIB      := $(BUILD)/libmodxcore.a
 TEST_SRC := $(wildcard tests/test_*.c)
@@ -80,7 +80,7 @@ bench-quick: $(BUILD)/todo $(BUILD)/loadgen
 # Fuzzing. `make fuzz` builds every target with the stand-alone driver under
 # ASan + UBSan and runs FUZZ_ITERS mutations each (works with Apple clang).
 # `make fuzz-libfuzzer` links the same targets against libFuzzer (LLVM clang).
-FUZZ_TARGETS := http json journal
+FUZZ_TARGETS := http json journal ws
 FUZZ_ITERS   ?= 200000
 FUZZ_CC      ?= $(CC)
 fuzz:

@@ -47,6 +47,7 @@ typedef struct {
     sbuf body;
     sbuf headers;      /* extra "Name: value\r\n" lines */
     int sse;           /* switch the connection into an SSE stream */
+    int ws;            /* 101: switch the connection to WebSocket (set by mx_ws_accept) */
     int file_fd;       /* >= 0: the body is file_len bytes streamed from this fd (taken over
                           and closed by the server); body must be empty. -1 = none */
     size_t file_len;
@@ -80,6 +81,11 @@ struct http_conn {
     int64_t req_start; /* mono ms of the first byte of the request being received (0 = none) */
     int64_t out_since; /* mono ms output has been waiting / last write progress (0 = none) */
     int64_t requests;  /* requests served on this connection */
+    int is_ws;         /* WebSocket after a 101 */
+    int ws_closing;    /* close frame sent */
+    int ws_msg_op;     /* opcode of the message being reassembled (0 = none) */
+    sbuf ws_msg;       /* fragments so far */
+    int64_t ws_ping_due; /* a ping is out; the peer must answer before this (0 = none) */
     int want_write;    /* registered for writability with kqueue / epoll */
     int held;          /* group commit: output waits for the durability barrier */
     size_t hold_mark;  /* out.len before the first held response */
@@ -120,6 +126,11 @@ struct http_server {
     size_t gzip_min;             /* gzip compressible responses of at least this many bytes (0 = off) */
     int gzip_level;              /* 1..9, 0 = 6 */
     int64_t gzip_in, gzip_out;   /* bytes before / after compression */
+    /* WebSocket: a complete message (text / binary) arrived. data is valid during the call. */
+    void (*on_ws_message)(http_server *srv, http_conn *c, int opcode, const char *data, size_t len, void *ctx);
+    size_t ws_max_message;       /* 0 = MX_WS_MAX_MESSAGE */
+    int64_t ws_ping_ms;          /* 0 = MX_WS_PING_MS */
+    int64_t ws_messages;
     int use_poll;                /* 1 = poll() even where kqueue / epoll exist */
     int poll_fd;                 /* kqueue / epoll descriptor (-1 = poll()) */
     struct pollfd *pfds;         /* poll() fallback set */

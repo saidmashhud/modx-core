@@ -6,6 +6,7 @@ import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import net from 'node:net';
+import { randomBytes, createHash } from 'node:crypto';
 
 const BIN = resolve(process.argv[2] || './build/todo');
 const root = mkdtempSync(join(tmpdir(), 'modx-todo-'));
@@ -69,6 +70,48 @@ function sse(path, headers = {}) {
   return { events, close: () => sock.destroy() };
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Raw WebSocket client: handshake, masked frames, frame reader.
+function wsRaw(path = '/api/ws', { key = randomBytes(16).toString('base64'), version = '13' } = {}) {
+  const u = new URL(base + path);
+  const sock = net.connect(Number(u.port), u.hostname);
+  const st = { status: 0, headers: '', frames: [], closed: false, buf: Buffer.alloc(0), key };
+  sock.on('error', () => {});
+  sock.on('close', () => { st.closed = true; });
+  sock.on('data', (d) => {
+    st.buf = Buffer.concat([st.buf, d]);
+    if (!st.status) {
+      const i = st.buf.indexOf('\r\n\r\n');
+      if (i < 0) return;
+      st.headers = st.buf.subarray(0, i).toString();
+      st.status = Number(st.headers.slice(9, 12));
+      st.buf = st.buf.subarray(i + 4);
+    }
+    for (;;) {
+      if (st.buf.length < 2) break;
+      let len = st.buf[1] & 0x7f, h = 2;
+      if (len === 126) { if (st.buf.length < 4) break; len = st.buf.readUInt16BE(2); h = 4; }
+      else if (len === 127) { if (st.buf.length < 10) break; len = Number(st.buf.readBigUInt64BE(2)); h = 10; }
+      if (st.buf.length < h + len) break;
+      st.frames.push({ fin: !!(st.buf[0] & 0x80), op: st.buf[0] & 0x0f, data: st.buf.subarray(h, h + len) });
+      st.buf = st.buf.subarray(h + len);
+    }
+  });
+  sock.write(`GET ${u.pathname} HTTP/1.1\r\nHost: ${u.host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ${key}\r\nSec-WebSocket-Version: ${version}\r\n\r\n`);
+  st.send = (op, payload = Buffer.alloc(0), { fin = true, mask = true, rsv = 0 } = {}) => {
+    const p = Buffer.isBuffer(payload) ? payload : Buffer.from(payload);
+    const hdr = [((fin ? 0x80 : 0) | (rsv << 4) | op)];
+    if (p.length < 126) hdr.push((mask ? 0x80 : 0) | p.length);
+    else if (p.length < 65536) hdr.push((mask ? 0x80 : 0) | 126, p.length >> 8, p.length & 255);
+    else { hdr.push((mask ? 0x80 : 0) | 127); const b = Buffer.alloc(8); b.writeBigUInt64BE(BigInt(p.length)); hdr.push(...b); }
+    const m = randomBytes(4);
+    const body = mask ? Buffer.from(p.map((x, i) => x ^ m[i & 3])) : p;
+    sock.write(Buffer.concat([Buffer.from(hdr), mask ? m : Buffer.alloc(0), body]));
+  };
+  st.raw = (b) => sock.write(b);
+  st.end = () => sock.destroy();
+  return st;
+}
 async function until(fn, ms = 3000) { const t = Date.now(); while (Date.now() - t < ms) { if (fn()) return true; await sleep(20); } return false; }
 
 try {
@@ -186,6 +229,65 @@ try {
     for (const r of j3) await api('DELETE', `/api/todos/${r.id}`);
   }
 
+  section('WebSocket (RFC 6455)');
+  {
+    const w = wsRaw();
+    check(await until(() => w.status === 101), 'handshake 101', w.headers);
+    const want = createHash('sha1').update(w.key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
+    check(w.headers.includes(`Sec-WebSocket-Accept: ${want}`), 'Sec-WebSocket-Accept');
+    w.send(1, 'hello');
+    check(await until(() => w.frames.length >= 1), 'echo arrives');
+    check(w.frames[0]?.op === 1 && w.frames[0].data.toString() === 'hello', 'text echo', w.frames[0]?.data.toString());
+    w.send(1, 'Hel', { fin: false });
+    w.send(9, 'mid');                       // a control frame between fragments
+    w.send(0, 'lo, ', { fin: false });
+    w.send(0, 'мир 😀');
+    check(await until(() => w.frames.length >= 3), 'fragmented message + pong');
+    check(w.frames[1]?.op === 10 && w.frames[1].data.toString() === 'mid', 'pong echoes the ping payload');
+    check(w.frames[2]?.data.toString() === 'Hello, мир 😀', 'fragments reassembled', w.frames[2]?.data.toString());
+    const bin = randomBytes(70000);         // 64-bit length frame
+    w.send(2, bin);
+    check(await until(() => w.frames.length >= 4, 5000) && w.frames[3].op === 2 && Buffer.compare(w.frames[3].data, bin) === 0, 'binary 70 kB round trip');
+    // the change feed: a write shows up on the socket
+    const n0 = w.frames.length;
+    const c = await api('POST', '/api/todos', { title: 'via ws', list: 'ws' });
+    check(await until(() => w.frames.slice(n0).some((f) => f.op === 1 && f.data.toString().includes('"via ws"'))), 'change pushed over WebSocket');
+    await api('DELETE', `/api/todos/${c.json.id}`);
+    // closing handshake: the server echoes the code and closes TCP
+    const nc = w.frames.length;
+    w.send(8, Buffer.from([0x03, 0xe8, 0x62, 0x79, 0x65])); // 1000 "bye"
+    check(await until(() => w.closed), 'closed after the close handshake');
+    const cf = w.frames.slice(nc).find((f) => f.op === 8);
+    check(cf && cf.data.readUInt16BE(0) === 1000, 'close echoed with 1000');
+    // protocol errors
+    const closeCode = async (fn) => { const x = wsRaw(); await until(() => x.status === 101); fn(x); await until(() => x.closed, 3000); const f = x.frames.find((y) => y.op === 8); return f ? f.data.readUInt16BE(0) : null; };
+    check(await closeCode((x) => x.send(1, 'unmasked', { mask: false })) === 1002, 'unmasked client frame -> 1002');
+    check(await closeCode((x) => x.send(1, 'rsv', { rsv: 4 })) === 1002, 'RSV bits -> 1002');
+    check(await closeCode((x) => x.send(0, 'orphan')) === 1002, 'continuation without start -> 1002');
+    check(await closeCode((x) => { x.send(1, 'a', { fin: false }); x.send(1, 'b'); }) === 1002, 'new message inside a fragmented one -> 1002');
+    check(await closeCode((x) => x.send(1, Buffer.from([0xc3, 0x28]))) === 1007, 'invalid UTF-8 -> 1007');
+    check(await closeCode((x) => x.send(9, 'p', { fin: false })) === 1002, 'fragmented ping -> 1002');
+    check(await closeCode((x) => x.send(2, randomBytes(1100000))) === 1009, 'message above the limit -> 1009');
+    // handshake refusals
+    const bad = wsRaw('/api/ws', { version: '8' });
+    check(await until(() => bad.status === 426) && bad.headers.includes('Sec-WebSocket-Version: 13'), 'wrong version -> 426');
+    bad.end();
+    const badKey = wsRaw('/api/ws', { key: 'short' });
+    check(await until(() => badKey.status === 400), 'bad key -> 400');
+    badKey.end();
+    // the built-in Node client interoperates
+    if (typeof WebSocket === 'function') {
+      const got = await new Promise((res) => {
+        const ws = new WebSocket(base.replace('http', 'ws') + '/api/ws');
+        ws.onopen = () => ws.send('from node');
+        ws.onmessage = (e) => { res(e.data); ws.close(); };
+        ws.onerror = () => res(null);
+        setTimeout(() => res(null), 3000);
+      });
+      check(got === 'from node', 'Node WebSocket client echo', got);
+    }
+  }
+
   section('connection limit');
   {
     // TODO_MAX_CONNS is 4096 by default; open 300 idle keep-alive sockets and still get served
@@ -200,7 +302,11 @@ try {
   section('slow clients and graceful shutdown');
   {
     await stop();
-    await start({ TODO_HEADER_TIMEOUT_MS: '400', TODO_BODY_TIMEOUT_MS: '800', TODO_IDLE_MS: '1500' });
+    await start({ TODO_HEADER_TIMEOUT_MS: '400', TODO_BODY_TIMEOUT_MS: '800', TODO_IDLE_MS: '1500', TODO_WS_PING_MS: '300' });
+    const silent = wsRaw();
+    check(await until(() => silent.status === 101), 'ws open');
+    check(await until(() => silent.frames.some((f) => f.op === 9), 2000), 'server pings an idle WebSocket');
+    check(await until(() => silent.closed, 3000), 'and drops it when no pong comes back');
     const port = Number(new URL(base).port);
     const raw = (writes, gapMs) => new Promise((res) => {
       const s = net.connect(port, '127.0.0.1');
@@ -231,6 +337,8 @@ try {
     s.write(`POST /api/todos HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: ${body.length}\r\n\r\n${body.slice(0, 5)}`);
     await sleep(100);
     const live2 = sse('/api/events');
+    const wsd = wsRaw();
+    await until(() => wsd.status === 101);
     await sleep(100);
     const exited = new Promise((r) => proc.once('exit', (code) => r(code)));
     proc.kill('SIGTERM');
@@ -240,6 +348,7 @@ try {
     await sleep(50);
     check(got.startsWith('HTTP/1.1 201') && got.includes('Connection: close'), 'in-flight request answered during drain', got.slice(0, 60));
     check(code === 0, 'clean exit', code);
+    check(wsd.frames.some((f) => f.op === 8 && f.data.readUInt16BE(0) === 1001), 'WebSocket told 1001 going away');
     live2.close();
     s.destroy();
     await start();

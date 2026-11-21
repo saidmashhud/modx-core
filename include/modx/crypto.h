@@ -34,6 +34,15 @@ void hex_encode(const unsigned char *in, size_t len, char *out);
 /* Returns number of bytes decoded, or -1 on invalid input / overflow. */
 long hex_decode(const char *in, unsigned char *out, size_t outcap);
 
+#define SHA1_LEN 20
+/* SHA-1: only for protocol needs such as the WebSocket handshake (not for secrets). */
+void sha1(const void *data, size_t len, unsigned char out[SHA1_LEN]);
+
+/* Standard base64 with padding; out must hold 4 * ((len + 2) / 3) + 1 bytes. */
+void base64_encode(const unsigned char *in, size_t len, char *out);
+/* Returns bytes decoded, or -1 on invalid input / overflow. */
+long base64_decode(const char *in, unsigned char *out, size_t outcap);
+
 #define PASSWORD_ITERS 150000
 #define PASSWORD_SALT_LEN 16
 

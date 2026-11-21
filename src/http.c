@@ -1,5 +1,6 @@
 #include "modx/http.h"
 #include "modx/gzip.h"
+#include "modx/ws.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -279,6 +280,7 @@ static void conn_free(http_server *srv, http_conn *c) {
     if (c->app) { if (srv->app_free) srv->app_free(c->app); else free(c->app); }
     sbuf_free(&c->in);
     sbuf_free(&c->out);
+    sbuf_free(&c->ws_msg);
     free(c);
 }
 
@@ -324,6 +326,13 @@ static void maybe_gzip(http_server *srv, const http_request *req, http_response 
 }
 
 static void serialize_response(http_server *srv, http_conn *c, const http_request *req, http_response *resp) {
+    if (resp->ws) {
+        sbuf_puts(&c->out, "HTTP/1.1 101 Switching Protocols\r\n");
+        if (resp->headers.len) sbuf_put(&c->out, resp->headers.data, resp->headers.len);
+        sbuf_puts(&c->out, "\r\n");
+        c->is_ws = 1;
+        return;
+    }
     maybe_gzip(srv, req, resp);
     if (resp->sse) {
         sbuf_printf(&c->out,
@@ -359,7 +368,7 @@ static void serialize_response(http_server *srv, http_conn *c, const http_reques
 }
 
 static void process_input(http_server *srv, http_conn *c) {
-    while (!c->is_sse && !c->close_after_write && c->in.len) {
+    while (!c->is_sse && !c->is_ws && !c->close_after_write && c->in.len) {
         if (c->send_fd >= 0) { c->resume = 1; return; } /* keep responses in order */
         /* body still arriving: the headers were parsed (and the body limit checked) once */
         if (c->need && c->in.len < c->need) return;
@@ -410,6 +419,7 @@ static void process_input(http_server *srv, http_conn *c) {
         /* don't keep a 50 MiB upload buffer around on an idle keep-alive connection */
         if (c->in.cap > HTTP_MAX_HEADER + HTTP_MAX_BODY) sbuf_shrink(&c->in);
     }
+    if (c->is_ws && c->in.len && !c->close_after_write) mx_ws_on_input(srv, c);
 }
 
 static int conn_pending(const http_conn *c) { return c->out.len > c->out_off || c->send_fd >= 0; }
@@ -525,6 +535,7 @@ static void timeouts(http_server *srv, int64_t now) {
         if (c->dead) continue;
         int pending = conn_pending(c) && !c->held;
         if (pending && c->out_since && now - c->out_since > wr) { c->dead = 1; srv->timeouts++; continue; }
+        if (c->is_ws) { mx_ws_tick(srv, c, now); continue; }
         if (c->is_sse || c->close_after_write) continue;
         if (c->req_start && !c->held && !pending) {
             int64_t limit = c->need ? body : hdr; /* need is set once the headers are parsed */
@@ -757,6 +768,7 @@ static void drain(http_server *srv) {
             http_conn *c = srv->conns[i];
             if (c->dead) continue;
             if (c->is_sse) { c->dead = 1; continue; } /* clients reconnect elsewhere / later */
+            if (c->is_ws && !c->ws_closing) mx_ws_close(c, 1001, "server shutting down");
             if (c->req_start || conn_pending(c) || c->held) busy++;
             else c->dead = 1;                         /* idle keep-alive: just close */
         }

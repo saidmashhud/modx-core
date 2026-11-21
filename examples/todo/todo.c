@@ -8,6 +8,7 @@
  *   DELETE /api/todos/<id>                              -> 204
  *   GET    /api/changes?since=<seq>                     -> [change, ...] or 410
  *   GET    /api/events                                  -> SSE (Last-Event-ID catch-up)
+ *   GET    /api/ws                                      -> WebSocket: change feed + echo
  *   GET    /api/stats                                   -> counters (bench)
  *   POST   /api/compact[?bg=1]                          -> compact now / in the background (TODO_ADMIN=1)
  *   POST   /api/fault                                   -> fail the next commit (TODO_ADMIN=1, tests)
@@ -35,6 +36,7 @@
 #include "modx/static.h"
 #include "modx/store.h"
 #include "modx/util.h"
+#include "modx/ws.h"
 
 enum { C_TODOS, C_NCOLL };
 static const char *const TODO_INDEX[] = { "list", NULL };
@@ -192,6 +194,11 @@ static void handle(http_server *srv, http_conn *c, const http_request *req, http
     }
     if (get && strcmp(p, "/api/health") == 0) { reply_json(resp, 200, "{\"ok\":true}"); return; }
     if (get && strcmp(p, "/api/events") == 0) { open_events(a, c, req, resp); return; }
+    if (get && strcmp(p, "/api/ws") == 0) {
+        int st = mx_ws_accept(c, req, resp, NULL, NULL);
+        if (st) reply_err(resp, st, st == 426 ? "upgrade_required" : "bad_handshake");
+        return;
+    }
     if (get && strcmp(p, "/api/stats") == 0) {
         mx_store *st = a->st;
         resp->content_type = "application/json; charset=utf-8";
@@ -267,10 +274,18 @@ static void handle(http_server *srv, http_conn *c, const http_request *req, http
     reply_err(resp, 404, "not_found");
 }
 
-/* Durable change -> every SSE stream. */
+/* Durable change -> every SSE stream and every WebSocket. */
 static void on_durable(void *ctx, const mx_change *ch) {
     app *a = ctx;
     mx_sse_broadcast(&a->sse, NULL, NULL, NULL, ch->seq, ch->json);
+    mx_ws_broadcast(a->sse.srv, NULL, NULL, MX_WS_TEXT, ch->json, strlen(ch->json));
+}
+
+/* WebSocket messages are echoed back with the same opcode. */
+static void on_ws_message(http_server *srv, http_conn *c, int opcode, const char *data, size_t len, void *ctx) {
+    (void)srv;
+    (void)ctx;
+    mx_ws_send(c, opcode, data, len);
 }
 
 static void tick(http_server *srv, void *ctx) {
@@ -358,6 +373,9 @@ int main(void) {
     srv.durable_pending = mx_store_pending_cb;
     srv.durable_commit = mx_store_commit_cb;
     srv.durable_ctx = a.st;
+    srv.on_ws_message = on_ws_message;
+    srv.ws_max_message = (size_t)env_long("TODO_WS_MAX", 0);
+    srv.ws_ping_ms = env_long("TODO_WS_PING_MS", 0);
     srv.handler = handle;
     srv.tick = tick;
     srv.ctx = &a;

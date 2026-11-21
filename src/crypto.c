@@ -252,3 +252,83 @@ int password_verify(const char *password, const char *stored) {
     pbkdf2_sha256(password, strlen(password), salt, (size_t)sl, (uint32_t)iters, got, sizeof got);
     return ct_equal(got, want, SHA256_LEN);
 }
+
+/* ---------------- SHA-1 (only for the WebSocket handshake, RFC 6455) ---------------- */
+
+static uint32_t rol32(uint32_t x, int n) { return (x << n) | (x >> (32 - n)); }
+
+void sha1(const void *data, size_t len, unsigned char out[SHA1_LEN]) {
+    uint32_t h[5] = { 0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0 };
+    const unsigned char *p = data;
+    uint64_t bits = (uint64_t)len * 8;
+    size_t total = ((len + 8) / 64 + 1) * 64;
+    unsigned char block[64];
+    for (size_t off = 0; off < total; off += 64) {
+        for (size_t i = 0; i < 64; i++) {
+            size_t k = off + i;
+            if (k < len) block[i] = p[k];
+            else if (k == len) block[i] = 0x80;
+            else if (k >= total - 8) block[i] = (unsigned char)(bits >> (8 * (total - 1 - k)));
+            else block[i] = 0;
+        }
+        uint32_t w[80];
+        for (int i = 0; i < 16; i++)
+            w[i] = (uint32_t)block[4 * i] << 24 | (uint32_t)block[4 * i + 1] << 16 | (uint32_t)block[4 * i + 2] << 8 | block[4 * i + 3];
+        for (int i = 16; i < 80; i++) w[i] = rol32(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+        uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4];
+        for (int i = 0; i < 80; i++) {
+            uint32_t f, k;
+            if (i < 20) { f = (b & c) | (~b & d); k = 0x5A827999; }
+            else if (i < 40) { f = b ^ c ^ d; k = 0x6ED9EBA1; }
+            else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDC; }
+            else { f = b ^ c ^ d; k = 0xCA62C1D6; }
+            uint32_t t = rol32(a, 5) + f + e + k + w[i];
+            e = d; d = c; c = rol32(b, 30); b = a; a = t;
+        }
+        h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e;
+    }
+    for (int i = 0; i < 5; i++) {
+        out[4 * i] = (unsigned char)(h[i] >> 24);
+        out[4 * i + 1] = (unsigned char)(h[i] >> 16);
+        out[4 * i + 2] = (unsigned char)(h[i] >> 8);
+        out[4 * i + 3] = (unsigned char)h[i];
+    }
+}
+
+/* ---------------- base64 ---------------- */
+
+static const char B64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+void base64_encode(const unsigned char *in, size_t len, char *out) {
+    size_t o = 0;
+    for (size_t i = 0; i < len; i += 3) {
+        uint32_t v = (uint32_t)in[i] << 16 | (i + 1 < len ? (uint32_t)in[i + 1] << 8 : 0) | (i + 2 < len ? in[i + 2] : 0);
+        out[o++] = B64[(v >> 18) & 63];
+        out[o++] = B64[(v >> 12) & 63];
+        out[o++] = i + 1 < len ? B64[(v >> 6) & 63] : '=';
+        out[o++] = i + 2 < len ? B64[v & 63] : '=';
+    }
+    out[o] = 0;
+}
+
+long base64_decode(const char *in, unsigned char *out, size_t outcap) {
+    size_t n = strlen(in), o = 0;
+    if (n % 4) return -1;
+    for (size_t i = 0; i < n; i += 4) {
+        int v[4];
+        for (int k = 0; k < 4; k++) {
+            char ch = in[i + k];
+            const char *pos = ch ? strchr(B64, ch) : NULL;
+            v[k] = ch == '=' ? -2 : pos ? (int)(pos - B64) : -1;
+            if (v[k] == -1) return -1;
+        }
+        if (v[0] < 0 || v[1] < 0 || (v[2] == -2 && v[3] != -2) || ((v[2] == -2 || v[3] == -2) && i + 4 != n)) return -1;
+        uint32_t x = (uint32_t)v[0] << 18 | (uint32_t)v[1] << 12 | (uint32_t)(v[2] < 0 ? 0 : v[2]) << 6 | (uint32_t)(v[3] < 0 ? 0 : v[3]);
+        size_t emit = v[2] == -2 ? 1 : v[3] == -2 ? 2 : 3;
+        if (o + emit > outcap) return -1;
+        out[o++] = (unsigned char)(x >> 16);
+        if (emit > 1) out[o++] = (unsigned char)(x >> 8);
+        if (emit > 2) out[o++] = (unsigned char)x;
+    }
+    return (long)o;
+}
