@@ -13,7 +13,11 @@
 #define HTTP_FILE_CHUNK (256 * 1024)         /* file responses are streamed in chunks of this size */
 #define HTTP_MAX_HEADER (64 * 1024)
 #define HTTP_MAX_CONNS 1024
-#define HTTP_IDLE_MS 60000
+#define HTTP_IDLE_MS 60000             /* keep-alive connection without a request */
+#define HTTP_HEADER_TIMEOUT_MS 10000   /* first byte of a request -> end of its headers */
+#define HTTP_BODY_TIMEOUT_MS 60000     /* first byte of a request -> end of its body */
+#define HTTP_WRITE_TIMEOUT_MS 60000    /* pending output without progress */
+#define HTTP_DRAIN_MS 5000             /* graceful shutdown budget */
 #define HTTP_SSE_MAX_BACKLOG (8 * 1024 * 1024)
 
 typedef struct {
@@ -73,6 +77,9 @@ struct http_conn {
     size_t send_left;
     int resume;        /* input left unprocessed while a file was streaming */
     char ip[64];       /* peer address */
+    int64_t req_start; /* mono ms of the first byte of the request being received (0 = none) */
+    int64_t out_since; /* mono ms output has been waiting / last write progress (0 = none) */
+    int64_t requests;  /* requests served on this connection */
     int want_write;    /* registered for writability with kqueue / epoll */
     int held;          /* group commit: output waits for the durability barrier */
     size_t hold_mark;  /* out.len before the first held response */
@@ -94,6 +101,13 @@ struct http_server {
     void (*app_free)(void *app);   /* frees http_conn.app (NULL = free()) */
     size_t max_conns;              /* 0 = HTTP_MAX_CONNS */
     int64_t idle_ms;               /* 0 = HTTP_IDLE_MS */
+    int64_t header_timeout_ms;     /* 0 = HTTP_HEADER_TIMEOUT_MS (slowloris) */
+    int64_t body_timeout_ms;       /* 0 = HTTP_BODY_TIMEOUT_MS */
+    int64_t write_timeout_ms;      /* 0 = HTTP_WRITE_TIMEOUT_MS */
+    int64_t drain_ms;              /* 0 = HTTP_DRAIN_MS */
+    int64_t timeouts;              /* connections dropped by a timeout */
+    int64_t last_timeout_check;
+    int draining;
     size_t nconns_peak;
     /* Durability barrier (group commit). When set, a response produced while
      * durable_pending() is true is held back; once per loop iteration
@@ -139,6 +153,9 @@ long http_parse_request_need(const char *buf, size_t len, http_request *req, int
 void http_request_free(http_request *r);
 
 int http_server_listen(http_server *srv, const char *host, int port);
+/* On return (after *stop) the server has drained: no new connections,
+ * event streams closed, requests already arriving answered, held responses
+ * committed and flushed (bounded by drain_ms). */
 /* "kqueue", "epoll" or "poll" (valid once the server runs). */
 const char *http_server_poller(const http_server *srv);
 /* Runs until *stop becomes non-zero. Uses kqueue (macOS / BSD) or epoll

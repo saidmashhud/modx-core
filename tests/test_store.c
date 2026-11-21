@@ -537,6 +537,92 @@ static void t_indexes(void) {
     rm_rf(dir);
 }
 
+/* Copy src to dst truncated to n bytes. */
+static void copy_prefix(const char *src, const char *dst, long n) {
+    FILE *in = fopen(src, "rb"), *out = fopen(dst, "wb");
+    if (!in || !out) { perror("copy"); exit(2); }
+    for (long i = 0; i < n; i++) {
+        int ch = fgetc(in);
+        if (ch == EOF) break;
+        fputc(ch, out);
+    }
+    fclose(in);
+    fclose(out);
+}
+
+static void t_crash_points(void) {
+    /* a journal cut at every byte offset recovers exactly the complete records before the cut */
+    char *dir = make_tmpdir();
+    char *jp = file_path(dir, "journal.log");
+    mx_store *st = open_st(dir, 100);
+    long ends[6] = { 0 };
+    for (int i = 0; i < 5; i++) {
+        char id[8];
+        snprintf(id, sizeof id, "k%d", i);
+        mx_store_put(st, T_ITEMS, item(id, i), NULL);
+        mx_store_sync(st);
+        ends[i + 1] = file_size(jp);
+    }
+    mx_store_close(st);
+    char *full = file_path(dir, "journal.full");
+    copy_prefix(jp, full, ends[5]);
+    int ok = 1;
+    for (long cut = 0; cut <= ends[5]; cut++) {
+        copy_prefix(full, jp, cut);
+        st = open_st(dir, 100);
+        int complete = 0;
+        while (complete < 5 && ends[complete + 1] <= cut) complete++;
+        if (!st || st->seq != complete || (long)mx_store_count(st, T_ITEMS) != complete) ok = 0;
+        if (st && file_size(jp) != ends[complete]) ok = 0; /* the torn tail is cut back */
+        mx_store_close(st);
+    }
+    CHECK(ok);
+    /* a flipped byte anywhere in a record drops that record and everything after it */
+    copy_prefix(full, jp, ends[5]);
+    {
+        FILE *f = fopen(jp, "r+b");
+        fseek(f, ends[2] + 20, SEEK_SET);
+        int ch = fgetc(f);
+        fseek(f, ends[2] + 20, SEEK_SET);
+        fputc(ch ^ 0x20, f);
+        fclose(f);
+    }
+    st = open_st(dir, 100);
+    CHECK(st && st->seq == 2 && st->recovered_truncated);
+    mx_store_close(st);
+    /* snapshots: a leftover tmp file is ignored, a truncated snapshot is refused */
+    copy_prefix(full, jp, ends[5]);
+    st = open_st(dir, 100);
+    CHECK(mx_store_compact(st) == 0);
+    mx_store_close(st);
+    char *sp = file_path(dir, "snapshot.json"), *tp = file_path(dir, "snapshot.json.tmp");
+    append_raw(tp, "{\"seq\":999,\"collections\":{\"items\":[{\"id\":\"ghost\"}]}}");
+    st = open_st(dir, 100);
+    CHECK(st && st->seq == 5 && !mx_store_get(st, T_ITEMS, "ghost"));
+    mx_store_close(st);
+    long ss = file_size(sp);
+    char *sfull = file_path(dir, "snapshot.full");
+    copy_prefix(sp, sfull, ss);
+    int refused = 1;
+    for (long cut = 1; cut < ss - 1; cut += 7) {
+        copy_prefix(sfull, sp, cut);
+        char err[256];
+        mx_store *bad = mx_store_open(dir, DEFS, T_NCOLL, 10, &HOOKS, err, sizeof err);
+        if (bad) { refused = 0; mx_store_close(bad); }
+    }
+    CHECK(refused);
+    copy_prefix(sfull, sp, ss);
+    st = open_st(dir, 100);
+    CHECK(st && st->seq == 5 && mx_store_count(st, T_ITEMS) == 5);
+    mx_store_close(st);
+    free(sfull);
+    free(sp);
+    free(tp);
+    free(full);
+    free(jp);
+    rm_rf(dir);
+}
+
 void test_store_all(void) {
     RUN(t_hmap);
     RUN(t_append_reload);
@@ -547,4 +633,5 @@ void test_store_all(void) {
     RUN(t_flags_hooks);
     RUN(t_background_compaction);
     RUN(t_indexes);
+    RUN(t_crash_points);
 }

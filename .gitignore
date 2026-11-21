@@ -3,3 +3,4 @@ build-debug/
 todo-data/
 bench/results/smoke*.json
 *.dSYM/
+build-fuzz/

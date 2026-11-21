@@ -23,7 +23,7 @@ TEST_SRC := $(wildcard tests/test_*.c)
 TEST_OBJ := $(TEST_SRC:tests/%.c=$(BUILD)/tests/%.o)
 HDR      := $(wildcard include/modx/*.h)
 
-.PHONY: all lib test test-unit test-example debug test-debug examples bench bench-quick clean
+.PHONY: all lib test test-unit test-example debug test-debug examples bench bench-quick fuzz fuzz-libfuzzer clean
 
 all: lib examples
 
@@ -77,5 +77,29 @@ bench: $(BUILD)/todo $(BUILD)/loadgen
 bench-quick: $(BUILD)/todo $(BUILD)/loadgen
 	node bench/run.mjs --profile quick
 
+# Fuzzing. `make fuzz` builds every target with the stand-alone driver under
+# ASan + UBSan and runs FUZZ_ITERS mutations each (works with Apple clang).
+# `make fuzz-libfuzzer` links the same targets against libFuzzer (LLVM clang).
+FUZZ_TARGETS := http json journal
+FUZZ_ITERS   ?= 200000
+FUZZ_CC      ?= $(CC)
+fuzz:
+	mkdir -p build-fuzz
+	for t in $(FUZZ_TARGETS); do \
+	  $(FUZZ_CC) -O1 -g $(STD) -Iinclude $(CFLAGS) $(SAN_FLAGS) -o build-fuzz/fuzz_$$t fuzz/fuzz_$$t.c fuzz/seeds_$$t.c fuzz/driver.c $(SRC) $(LDLIBS) || exit 1; \
+	done
+	for t in $(FUZZ_TARGETS); do \
+	  n=$(FUZZ_ITERS); [ $$t = journal ] && n=$$(( $(FUZZ_ITERS) / 50 )); \
+	  ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 ./build-fuzz/fuzz_$$t $$n 2>build-fuzz/$$t.log || { tail -40 build-fuzz/$$t.log; exit 1; }; tail -1 build-fuzz/$$t.log; \
+	done
+
+FUZZ_SECONDS ?= 60
+fuzz-libfuzzer:
+	mkdir -p build-fuzz
+	for t in $(FUZZ_TARGETS); do \
+	  clang -O1 -g $(STD) -Iinclude $(CFLAGS) -fsanitize=fuzzer,address,undefined -o build-fuzz/lf_$$t fuzz/fuzz_$$t.c $(SRC) $(LDLIBS) || exit 1; \
+	  ./build-fuzz/lf_$$t -max_total_time=$(FUZZ_SECONDS) -max_len=65536 || exit 1; \
+	done
+
 clean:
-	rm -rf build build-debug
+	rm -rf build build-debug build-fuzz

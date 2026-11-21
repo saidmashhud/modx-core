@@ -15,7 +15,8 @@
  *
  * Environment: TODO_HOST (127.0.0.1), TODO_PORT (8080, 0 = any), TODO_DATA
  * (./todo-data), TODO_STATIC, TODO_SEED=<n> (seed n rows into an empty store),
- * TODO_COMPACT_BYTES, TODO_MAX_CONNS (4096), TODO_POLL=1 (poll() instead of
+ * TODO_COMPACT_BYTES, TODO_MAX_CONNS (4096), TODO_HEADER_TIMEOUT_MS /
+ * TODO_BODY_TIMEOUT_MS / TODO_IDLE_MS (library defaults), TODO_POLL=1 (poll() instead of
  * kqueue / epoll), TODO_GZIP_MIN (1024; 0 = no gzip), TODO_CACHE (1; 0 = no
  * list response cache), TODO_ADMIN=1. */
 
@@ -203,7 +204,8 @@ static void handle(http_server *srv, http_conn *c, const http_request *req, http
                     (long long)st->max_batch, http_server_poller(srv));
         sbuf_printf(o, "\"gzip_in\":%lld,\"gzip_out\":%lld,\"cache_hits\":%lld,\"cache_misses\":%lld,",
                     (long long)srv->gzip_in, (long long)srv->gzip_out, (long long)a->cache.hits, (long long)a->cache.misses);
-        sbuf_printf(o, "\"conns\":%zu,\"peak_conns\":%zu,\"streams\":%zu,\"max_rss_kb\":%ld}", srv->nconns,
+        sbuf_printf(o, "\"timeouts\":%lld,\"conns\":%zu,\"peak_conns\":%zu,\"streams\":%zu,\"max_rss_kb\":%ld}",
+                    (long long)srv->timeouts, srv->nconns,
                     srv->nconns_peak, mx_sse_count(&a->sse), rss_kb());
         return;
     }
@@ -339,6 +341,9 @@ int main(void) {
     srv.listen_fd = -1;
     srv.max_conns = (size_t)env_long("TODO_MAX_CONNS", 4096);
     srv.use_poll = env_long("TODO_POLL", 0) == 1;
+    srv.header_timeout_ms = env_long("TODO_HEADER_TIMEOUT_MS", 0);
+    srv.body_timeout_ms = env_long("TODO_BODY_TIMEOUT_MS", 0);
+    srv.idle_ms = env_long("TODO_IDLE_MS", 0);
     srv.gzip_min = (size_t)env_long("TODO_GZIP_MIN", 1024); /* 0 = off */
     a.use_cache = env_long("TODO_CACHE", 1) == 1;
     mx_cache_init(&a.cache, 8 << 20);

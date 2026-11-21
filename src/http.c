@@ -343,7 +343,8 @@ static void serialize_response(http_server *srv, http_conn *c, const http_reques
         sbuf_printf(&c->out, "Content-Type: %s\r\n", resp->content_type);
     if (resp->status != 204 && resp->status != 304)
         sbuf_printf(&c->out, "Content-Length: %zu\r\n", file ? resp->file_len : resp->body.len);
-    sbuf_printf(&c->out, "Connection: %s\r\n", req->keep_alive ? "keep-alive" : "close");
+    int keep = req->keep_alive && !srv->draining;
+    sbuf_printf(&c->out, "Connection: %s\r\n", keep ? "keep-alive" : "close");
     if (resp->headers.len) sbuf_put(&c->out, resp->headers.data, resp->headers.len);
     sbuf_puts(&c->out, "\r\n");
     if (file) {
@@ -354,7 +355,7 @@ static void serialize_response(http_server *srv, http_conn *c, const http_reques
     } else if (!no_body) {
         sbuf_put(&c->out, resp->body.data, resp->body.len);
     }
-    if (!req->keep_alive) c->close_after_write = 1;
+    if (!keep) c->close_after_write = 1;
 }
 
 static void process_input(http_server *srv, http_conn *c) {
@@ -403,6 +404,9 @@ static void process_input(http_server *srv, http_conn *c) {
         sbuf_free(&resp.headers);
         http_request_free(&req);
         sbuf_consume(&c->in, (size_t)n);
+        c->req_start = c->in.len ? mono_ms() : 0; /* a pipelined request may already be arriving */
+        c->requests++;
+        if (srv->draining) c->close_after_write = 1;
         /* don't keep a 50 MiB upload buffer around on an idle keep-alive connection */
         if (c->in.cap > HTTP_MAX_HEADER + HTTP_MAX_BODY) sbuf_shrink(&c->in);
     }
@@ -422,6 +426,7 @@ static void conn_flush(http_conn *c) {
                 return;
             }
             c->out_off += (size_t)w;
+            c->out_since = mono_ms(); /* progress */
         }
         c->out.len = 0;
         c->out_off = 0;
@@ -466,6 +471,7 @@ static void conn_read(http_server *srv, http_conn *c) {
         if (n == 0) { c->dead = 1; return; }
         c->last_active = mono_ms();
         if (discard) continue;
+        if (!c->req_start) c->req_start = c->last_active;
         c->in.len += (size_t)n;
         c->in.data[c->in.len] = 0;
         if ((size_t)n >= budget) break;
@@ -505,20 +511,51 @@ static void accept_all(http_server *srv) {
     }
 }
 
-static void reap(http_server *srv) {
-    int64_t now = mono_ms();
-    size_t k = 0;
-    /* presence hooks first, while every connection pointer is still valid */
+static int64_t or_default(int64_t v, int64_t d) { return v ? v : d; }
+
+/* Slow or stuck peers: headers that never finish (slowloris), bodies that
+ * trickle, keep-alive connections that idle, output nobody reads. */
+static void timeouts(http_server *srv, int64_t now) {
+    int64_t hdr = or_default(srv->header_timeout_ms, HTTP_HEADER_TIMEOUT_MS);
+    int64_t body = or_default(srv->body_timeout_ms, HTTP_BODY_TIMEOUT_MS);
+    int64_t wr = or_default(srv->write_timeout_ms, HTTP_WRITE_TIMEOUT_MS);
+    int64_t idle = or_default(srv->idle_ms, HTTP_IDLE_MS);
     for (size_t i = 0; i < srv->nconns; i++) {
         http_conn *c = srv->conns[i];
-        if (c->dead && c->app) {
-            if (srv->on_close) srv->on_close(srv, c, srv->ctx);
+        if (c->dead) continue;
+        int pending = conn_pending(c) && !c->held;
+        if (pending && c->out_since && now - c->out_since > wr) { c->dead = 1; srv->timeouts++; continue; }
+        if (c->is_sse || c->close_after_write) continue;
+        if (c->req_start && !c->held && !pending) {
+            int64_t limit = c->need ? body : hdr; /* need is set once the headers are parsed */
+            if (now - c->req_start > limit) {
+                static const char msg[] = "HTTP/1.1 408 Request Timeout\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                ssize_t w = write(c->fd, msg, sizeof msg - 1);
+                (void)w;
+                c->dead = 1;
+                srv->timeouts++;
+                continue;
+            }
         }
+        if (!c->req_start && !pending && now - c->last_active > idle) c->dead = 1;
+    }
+}
+
+static void reap(http_server *srv) {
+    int64_t now = mono_ms();
+    if (now - srv->last_timeout_check >= 100) {
+        srv->last_timeout_check = now;
+        timeouts(srv, now);
+    }
+    size_t k = 0;
+    /* close hooks first, while every connection pointer is still valid */
+    for (size_t i = 0; i < srv->nconns; i++) {
+        http_conn *c = srv->conns[i];
+        if (c->dead && c->app && srv->on_close) srv->on_close(srv, c, srv->ctx);
     }
     for (size_t i = 0; i < srv->nconns; i++) {
         http_conn *c = srv->conns[i];
-        int idle = !c->is_sse && now - c->last_active > (srv->idle_ms ? srv->idle_ms : HTTP_IDLE_MS);
-        if (c->dead || idle) conn_free(srv, c);
+        if (c->dead) conn_free(srv, c);
         else srv->conns[k++] = c;
     }
     srv->nconns = k;
@@ -704,13 +741,45 @@ static void wait_events(http_server *srv, int timeout_ms, volatile sig_atomic_t 
     if (pfds[0].revents & POLLIN) accept_all(srv);
 }
 
+static void loop_once(http_server *srv, int timeout_ms, volatile sig_atomic_t *stop);
+
+/* Graceful shutdown: stop accepting, end event streams, let requests that
+ * are already arriving finish (their responses carry Connection: close),
+ * make everything durable, flush, then return. Bounded by drain_ms. */
+static void drain(http_server *srv) {
+    srv->draining = 1;
+    if (srv->listen_fd >= 0) { close(srv->listen_fd); srv->listen_fd = -1; }
+    int64_t deadline = mono_ms() + or_default(srv->drain_ms, HTTP_DRAIN_MS);
+    volatile sig_atomic_t never = 0;
+    for (;;) {
+        size_t busy = 0;
+        for (size_t i = 0; i < srv->nconns; i++) {
+            http_conn *c = srv->conns[i];
+            if (c->dead) continue;
+            if (c->is_sse) { c->dead = 1; continue; } /* clients reconnect elsewhere / later */
+            if (c->req_start || conn_pending(c) || c->held) busy++;
+            else c->dead = 1;                         /* idle keep-alive: just close */
+        }
+        if (!busy || mono_ms() > deadline) break;
+        loop_once(srv, 50, &never);
+    }
+    barrier(srv);
+    reap(srv);
+}
+
 void http_server_run(http_server *srv, volatile sig_atomic_t *stop) {
     poller_open(srv);
     for (size_t i = 0; i < srv->nconns; i++) poller_add(srv, srv->conns[i]);
     srv->running = 1;
-    while (!*stop) {
-        wait_events(srv, 1000, stop);
-        if (*stop) break;
+    while (!*stop) loop_once(srv, 1000, stop);
+    drain(srv);
+    srv->running = 0;
+}
+
+static void loop_once(http_server *srv, int timeout_ms, volatile sig_atomic_t *stop) {
+    {
+        wait_events(srv, timeout_ms, stop);
+        if (*stop) return;
         if (srv->tick) srv->tick(srv, srv->ctx);
         barrier(srv);
         /* flush everything queued this round (responses, SSE pushes) */
@@ -723,11 +792,13 @@ void http_server_run(http_server *srv, volatile sig_atomic_t *stop) {
                 process_input(srv, c);
                 if (!c->dead && conn_pending(c)) conn_flush(c);
             }
-            poller_want_write(srv, c, !c->dead && conn_pending(c) && !c->held);
+            int pending = !c->dead && conn_pending(c) && !c->held;
+            if (!pending) c->out_since = 0;
+            else if (!c->out_since) c->out_since = mono_ms();
+            poller_want_write(srv, c, pending);
         }
         reap(srv);
     }
-    srv->running = 0;
 }
 
 void http_server_close(http_server *srv) {

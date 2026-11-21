@@ -197,6 +197,57 @@ try {
     socks.forEach((s) => s.destroy());
   }
 
+  section('slow clients and graceful shutdown');
+  {
+    await stop();
+    await start({ TODO_HEADER_TIMEOUT_MS: '400', TODO_BODY_TIMEOUT_MS: '800', TODO_IDLE_MS: '1500' });
+    const port = Number(new URL(base).port);
+    const raw = (writes, gapMs) => new Promise((res) => {
+      const s = net.connect(port, '127.0.0.1');
+      let got = '', closed = false, i = 0;
+      s.on('data', (d) => { got += d; });
+      s.on('close', () => { closed = true; res({ got, closed, sent: i }); });
+      s.on('error', () => {});
+      const timer = setInterval(() => { if (closed || i >= writes.length) return clearInterval(timer); s.write(writes[i++]); }, gapMs);
+      setTimeout(() => { if (!closed) { s.destroy(); res({ got, closed: false, sent: i }); } }, 4000);
+    });
+    // slowloris: one header byte every 100 ms never completes the headers
+    const sl = await raw(Array.from('GET /api/health HTTP/1.1\r\nX-Slow: ' + 'a'.repeat(60) + '\r\n\r\n'), 100);
+    check(sl.closed && sl.got.startsWith('HTTP/1.1 408') && sl.sent < 20, 'slowloris dropped with 408', sl);
+    // a body that trickles in past the body timeout
+    const head = 'POST /api/todos HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 40\r\n\r\n';
+    const tb = await raw([head, ...Array.from('{"title":"slow body......................}')], 150);
+    check(tb.closed && tb.got.startsWith('HTTP/1.1 408'), 'trickling body dropped', tb.got.slice(0, 40));
+    // idle keep-alive connections are closed, normal clients are unaffected
+    const idle = await raw(['GET /api/health HTTP/1.1\r\nHost: x\r\n\r\n'], 10);
+    check(idle.closed && idle.got.startsWith('HTTP/1.1 200'), 'idle keep-alive closed after serving');
+    check((await api('GET', '/api/health')).status === 200, 'fast clients fine');
+    check((await api('GET', '/api/stats')).json.timeouts >= 2, 'timeouts counted');
+    // SIGTERM while a request is half sent: it is still answered, then the server exits
+    const s = net.connect(port, '127.0.0.1');
+    let got = '';
+    s.on('data', (d) => { got += d; });
+    const body = JSON.stringify({ title: 'during shutdown', list: 'shutdown' });
+    s.write(`POST /api/todos HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: ${body.length}\r\n\r\n${body.slice(0, 5)}`);
+    await sleep(100);
+    const live2 = sse('/api/events');
+    await sleep(100);
+    const exited = new Promise((r) => proc.once('exit', (code) => r(code)));
+    proc.kill('SIGTERM');
+    await sleep(100);
+    s.write(body.slice(5));
+    const code = await exited;
+    await sleep(50);
+    check(got.startsWith('HTTP/1.1 201') && got.includes('Connection: close'), 'in-flight request answered during drain', got.slice(0, 60));
+    check(code === 0, 'clean exit', code);
+    live2.close();
+    s.destroy();
+    await start();
+    const sd = (await api('GET', '/api/todos?list=shutdown')).json;
+    check(sd.length === 1, 'and it was durable', sd);
+    await api('DELETE', `/api/todos/${sd[0].id}`);
+  }
+
   section('persistence');
   const before = (await api('GET', '/api/todos')).json;
   await stop();
