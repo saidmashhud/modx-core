@@ -165,7 +165,7 @@ try {
   check((await api('DELETE', `/api/todos/${id}`)).status === 204, 'delete');
   check((await api('GET', `/api/todos/${id}`)).status === 404, 'deleted');
 
-  section('strict request framing (smuggling)');
+  section('strict request framing (smuggling, Host)');
   {
     // "Content-Length : N" used to be ignored, so the body was parsed as a second, pipelined request
     const smug = 'POST /api/todos HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length : 37\r\n\r\n' +
@@ -178,6 +178,10 @@ try {
     check(statuses(r3.got).join() === '400', 'control character in a value: 400');
     const r4 = await rawOnce('GET /api/health HTTP/1.1\r\nHost: x\r\n\r\nGET /api/health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n');
     check(statuses(r4.got).join() === '200,200', 'well-formed pipelining still works', r4.got.slice(0, 80));
+    const r5 = await rawOnce('GET /api/health HTTP/1.1\r\n\r\n');
+    check(statuses(r5.got).join() === '400', 'HTTP/1.1 without Host: 400');
+    const r6 = await rawOnce('GET /api/health HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n');
+    check(statuses(r6.got).join() === '400', 'two Host headers: 400');
   }
 
   section('SSE fan-out and catch-up');
@@ -385,10 +389,10 @@ try {
       setTimeout(() => { if (!closed) { s.destroy(); res({ got, closed: false, sent: i }); } }, 4000);
     });
     // slowloris: one header byte every 100 ms never completes the headers
-    const sl = await raw(Array.from('GET /api/health HTTP/1.1\r\nX-Slow: ' + 'a'.repeat(60) + '\r\n\r\n'), 100);
+    const sl = await raw(Array.from('GET /api/health HTTP/1.1\r\nHost: x\r\nX-Slow: ' + 'a'.repeat(60) + '\r\n\r\n'), 100);
     check(sl.closed && sl.got.startsWith('HTTP/1.1 408') && sl.sent < 20, 'slowloris dropped with 408', sl);
     // a body that trickles in past the body timeout
-    const head = 'POST /api/todos HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 40\r\n\r\n';
+    const head = 'POST /api/todos HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 40\r\n\r\n';
     const tb = await raw([head, ...Array.from('{"title":"slow body......................}')], 150);
     check(tb.closed && tb.got.startsWith('HTTP/1.1 408'), 'trickling body dropped', tb.got.slice(0, 40));
     // idle keep-alive connections are closed, normal clients are unaffected
@@ -401,7 +405,7 @@ try {
     let got = '';
     s.on('data', (d) => { got += d; });
     const body = JSON.stringify({ title: 'during shutdown', list: 'shutdown' });
-    s.write(`POST /api/todos HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: ${body.length}\r\n\r\n${body.slice(0, 5)}`);
+    s.write(`POST /api/todos HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: ${body.length}\r\n\r\n${body.slice(0, 5)}`);
     await sleep(100);
     const live2 = sse('/api/events');
     const wsd = wsRaw();

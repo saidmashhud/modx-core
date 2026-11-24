@@ -193,7 +193,7 @@ long http_parse_request_need(const char *buf, size_t len, http_request *req, int
     /* headers */
     const char *p = line_end + 2;
     long content_length = 0;
-    int have_cl = 0;
+    int have_cl = 0, nhost = 0;
     req->keep_alive = !http10;
     while (p < end + 2) {
         const char *le = memchr(p, '\r', (size_t)(end + 2 - p));
@@ -223,6 +223,8 @@ long http_parse_request_need(const char *buf, size_t len, http_request *req, int
             if (n > HTTP_MAX_UPLOAD) { http_request_free(req); return -413; }
             content_length = n;
             have_cl = 1;
+        } else if (strcmp(name, "host") == 0) {
+            nhost++;
         } else if (strcmp(name, "transfer-encoding") == 0) {
             http_request_free(req);
             return -411;
@@ -234,6 +236,8 @@ long http_parse_request_need(const char *buf, size_t len, http_request *req, int
         }
         p = le + 2;
     }
+    /* RFC 9112 3.2: exactly one Host in HTTP/1.1, at most one in 1.0 */
+    if (nhost > 1 || (!http10 && nhost == 0)) { http_request_free(req); return -400; }
     if (content_length > HTTP_MAX_BODY) {
         size_t lim = limit_fn ? limit_fn(req, limit_ctx) : HTTP_MAX_BODY;
         if (lim > HTTP_MAX_UPLOAD) lim = HTTP_MAX_UPLOAD;

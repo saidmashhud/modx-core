@@ -37,10 +37,10 @@ static void t_parse(void) {
 
     /* incomplete: headers, then body */
     CHECK(parse("GET / HTTP/1.1\r\nHost: x\r\n", &r) == 0);
-    CHECK(parse("POST / HTTP/1.1\r\nContent-Length: 10\r\n\r\nabc", &r) == 0);
+    CHECK(parse("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nabc", &r) == 0);
     /* pipelined: only the first request is consumed */
-    raw = "GET /a HTTP/1.1\r\n\r\nGET /b HTTP/1.1\r\n\r\n";
-    CHECK(parse(raw, &r) == 19);
+    raw = "GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n";
+    CHECK(parse(raw, &r) == 28);
     CHECK_STR(r.path, "/a");
     http_request_free(&r);
 }
@@ -52,13 +52,13 @@ static void t_errors(void) {
     CHECK(parse("GET relative HTTP/1.1\r\n\r\n", &r) == -400);
     CHECK(parse("GET  HTTP/1.1\r\n\r\n", &r) == -400);
     CHECK(parse("GET /%00 HTTP/1.1\r\n\r\n", &r) == -400);
-    CHECK(parse("GET / HTTP/1.1\r\nNoColon\r\n\r\n", &r) == -400);
-    CHECK(parse("POST / HTTP/1.1\r\nContent-Length: -1\r\n\r\n", &r) == -400);
-    CHECK(parse("POST / HTTP/1.1\r\nContent-Length: 1x\r\n\r\n", &r) == -400);
-    CHECK(parse("POST / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\nx", &r) == -400);
-    CHECK(parse("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n", &r) == -411);
-    CHECK(parse("POST / HTTP/1.1\r\nContent-Length: 2000000\r\n\r\n", &r) == -413);
-    CHECK(parse("POST / HTTP/1.1\r\nContent-Length: 99999999999\r\n\r\n", &r) == -413);
+    CHECK(parse("GET / HTTP/1.1\r\nHost: x\r\nNoColon\r\n\r\n", &r) == -400);
+    CHECK(parse("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: -1\r\n\r\n", &r) == -400);
+    CHECK(parse("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1x\r\n\r\n", &r) == -400);
+    CHECK(parse("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\nx", &r) == -400);
+    CHECK(parse("POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n", &r) == -411);
+    CHECK(parse("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 2000000\r\n\r\n", &r) == -413);
+    CHECK(parse("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 99999999999\r\n\r\n", &r) == -413);
     /* header block too large */
     sbuf b;
     sbuf_init(&b);
@@ -68,11 +68,11 @@ static void t_errors(void) {
     CHECK(http_parse_request(b.data, b.len, &r, &expect) == -431);
     sbuf_free(&b);
     /* per-route body limit */
-    const char *up = "POST /upload HTTP/1.1\r\nContent-Length: 2000000\r\nExpect: 100-continue\r\n\r\n";
+    const char *up = "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 2000000\r\nExpect: 100-continue\r\n\r\n";
     size_t need = 0;
     CHECK(http_parse_request_need(up, strlen(up), &r, &expect, big_limit, NULL, &need) == 0);
     CHECK(expect == 1 && need == strlen(up) + 2000000);
-    const char *no = "POST /other HTTP/1.1\r\nContent-Length: 2000000\r\n\r\n";
+    const char *no = "POST /other HTTP/1.1\r\nHost: x\r\nContent-Length: 2000000\r\n\r\n";
     CHECK(http_parse_request_ex(no, strlen(no), &r, &expect, big_limit, NULL) == -413);
 }
 
@@ -122,6 +122,28 @@ static void t_strict_framing(void) {
     http_request_free(&r);
 }
 
+/* RFC 9112 3.2: HTTP/1.1 needs exactly one Host; HTTP/1.0 at most one. */
+static void t_host(void) {
+    http_request r;
+    CHECK(parse("GET / HTTP/1.1\r\n\r\n", &r) == -400);
+    CHECK(parse("GET / HTTP/1.1\r\nX: y\r\n\r\n", &r) == -400);
+    CHECK(parse("GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n", &r) == -400);
+    CHECK(parse("GET / HTTP/1.1\r\nHost: a\r\nhOST: a\r\n\r\n", &r) == -400);
+    CHECK(parse("GET / HTTP/1.0\r\nHost: a\r\nHost: b\r\n\r\n", &r) == -400);
+    /* no Host and a body that has not arrived yet: refused right away, not waited for */
+    CHECK(parse("POST / HTTP/1.1\r\nContent-Length: 10\r\n\r\n", &r) == -400);
+    const char *one = "GET / HTTP/1.1\r\nHost: example.com:8080\r\n\r\n";
+    CHECK(parse(one, &r) == (long)strlen(one));
+    CHECK_STR(http_req_header(&r, "host"), "example.com:8080");
+    http_request_free(&r);
+    const char *empty = "GET / HTTP/1.1\r\nHost:\r\n\r\n"; /* allowed: an empty authority */
+    CHECK(parse(empty, &r) == (long)strlen(empty));
+    http_request_free(&r);
+    const char *v10 = "GET / HTTP/1.0\r\n\r\n";
+    CHECK(parse(v10, &r) == (long)strlen(v10));
+    http_request_free(&r);
+}
+
 static void t_static(void) {
     CHECK(static_path_safe("/a/b.js"));
     CHECK(static_path_safe("/"));
@@ -144,5 +166,6 @@ void test_http_all(void) {
     RUN(t_parse);
     RUN(t_errors);
     RUN(t_strict_framing);
+    RUN(t_host);
     RUN(t_static);
 }
