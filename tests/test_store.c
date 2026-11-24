@@ -691,6 +691,7 @@ static void t_sticky_write_failure(void) {
     CHECK(mx_store_sync(st) == -1);                   /* write() fails with EFBIG */
     CHECK(setrlimit(RLIMIT_FSIZE, &old_rl) == 0);
     signal(SIGXFSZ, old_sig);
+    clearerr(stderr); /* stderr redirected to a file failed too while the limit was set */
 
     CHECK(mx_store_failed(st));
     mx_store_health_get(st, &h);
