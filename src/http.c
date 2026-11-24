@@ -597,12 +597,14 @@ static void barrier(http_server *srv) {
     int held = 0;
     for (size_t i = 0; i < srv->nconns && !held; i++) held = srv->conns[i]->held;
     if (!srv->durable_commit) return;
-    int ok = 1;
+    int ok = 1, unavailable = 0;
     if (srv->durable_pending && srv->durable_pending(srv->durable_ctx)) {
         srv->commits++;
         srv->in_barrier = 1; /* notifications sent by the commit go straight out */
-        ok = srv->durable_commit(srv->durable_ctx) == 0;
+        int rc = srv->durable_commit(srv->durable_ctx);
         srv->in_barrier = 0;
+        ok = rc == 0;
+        unavailable = rc <= HTTP_DURABLE_UNAVAILABLE;
         if (!ok) srv->commit_failures++;
     }
     /* pushes queued during the iteration follow the change notifications */
@@ -624,9 +626,16 @@ static void barrier(http_server *srv) {
             if (c->out.data) c->out.data[c->out.len] = 0;
             if (c->send_fd >= 0) { close(c->send_fd); c->send_fd = -1; c->send_left = 0; }
             static const char body[] = "{\"error\":{\"code\":\"internal\",\"message\":\"storage write failed\"}}";
-            sbuf_printf(&c->out,
-                        "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json; charset=utf-8\r\n"
-                        "Content-Length: %zu\r\nConnection: close\r\n\r\n%s", sizeof body - 1, body);
+            static const char body503[] =
+                "{\"error\":{\"code\":\"unavailable\",\"message\":\"storage is read-only after an I/O error\"}}";
+            if (unavailable)
+                sbuf_printf(&c->out,
+                            "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json; charset=utf-8\r\n"
+                            "Content-Length: %zu\r\nConnection: close\r\n\r\n%s", sizeof body503 - 1, body503);
+            else
+                sbuf_printf(&c->out,
+                            "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json; charset=utf-8\r\n"
+                            "Content-Length: %zu\r\nConnection: close\r\n\r\n%s", sizeof body - 1, body);
             c->close_after_write = 1;
             c->in.len = 0;
         }

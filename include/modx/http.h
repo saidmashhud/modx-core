@@ -20,6 +20,7 @@
 #define HTTP_DRAIN_MS 5000             /* graceful shutdown budget */
 #define HTTP_LINGER_MS 2000            /* after a final response: read and discard this long before closing */
 #define HTTP_SSE_MAX_BACKLOG (8 * 1024 * 1024)
+#define HTTP_DURABLE_UNAVAILABLE (-2)  /* durable_commit: storage refuses writes -> held responses become 503 */
 
 typedef struct {
     char *key;
@@ -123,7 +124,9 @@ struct http_server {
      * durable_pending() is true is held back; once per loop iteration
      * durable_commit() runs (one write + one fsync for everything the
      * iteration's requests changed) and only then are held responses sent.
-     * If the commit fails they are replaced by 500 responses. */
+     * If the commit fails (non-zero) they are replaced by 500 responses, or
+     * by 503 responses when it returns HTTP_DURABLE_UNAVAILABLE or less (the
+     * storage refuses writes, e.g. a store that failed earlier). */
     int (*durable_pending)(void *dctx);
     int (*durable_commit)(void *dctx);
     void *durable_ctx;

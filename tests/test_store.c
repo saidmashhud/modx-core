@@ -2,8 +2,11 @@
  * compaction, corrupt snapshots, the change ring and its window, listener
  * only after fsync, collection flags (private / no ring / redact), the
  * row_key / journal_extra / scope / on_apply hooks. */
+#include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdlib.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -661,6 +664,95 @@ static void t_crash_points(void) {
     rm_rf(dir);
 }
 
+/* A journal write that fails (here: RLIMIT_FSIZE, SIGXFSZ ignored -> EFBIG)
+ * must never be followed by a "durable" announcement of the lost records:
+ * the store fails for good (read-only), and a reopen shows what is on disk. */
+static void t_sticky_write_failure(void) {
+    char *dir = make_tmpdir();
+    char *jp = file_path(dir, "journal.log");
+    mx_store *st = open_st(dir, 100);
+    st->listener = count_listener;
+    listener_calls = 0;
+    CHECK(mx_store_put(st, T_ITEMS, item("ok", 1), NULL) == 0 && mx_store_sync(st) == 0 && listener_calls == 1);
+    mx_store_health h;
+    mx_store_health_get(st, &h);
+    CHECK(!h.failed && !mx_store_failed(st) && h.fail_op == NULL && h.synced_seq == 1);
+    long before = file_size(jp);
+
+    struct rlimit old_rl, rl;
+    CHECK(getrlimit(RLIMIT_FSIZE, &old_rl) == 0);
+    void (*old_sig)(int) = signal(SIGXFSZ, SIG_IGN);
+    rl = old_rl;
+    rl.rlim_cur = (rlim_t)before + 16; /* the next record does not fit */
+    CHECK(setrlimit(RLIMIT_FSIZE, &rl) == 0);
+    json *big = item("lost", 2);
+    json_set(big, "pad", json_str("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"));
+    CHECK(mx_store_put(st, T_ITEMS, big, NULL) == 0); /* queued; in memory */
+    CHECK(mx_store_sync(st) == -1);                   /* write() fails with EFBIG */
+    CHECK(setrlimit(RLIMIT_FSIZE, &old_rl) == 0);
+    signal(SIGXFSZ, old_sig);
+
+    CHECK(mx_store_failed(st));
+    mx_store_health_get(st, &h);
+    CHECK(h.failed && h.fail_errno == EFBIG && h.fail_op && strcmp(h.fail_op, "write") == 0);
+    CHECK(h.synced_seq == 1 && h.seq == 2 && h.pending_records == 0);
+    CHECK(listener_calls == 1);
+    CHECK(file_size(jp) == before); /* the partial tail was cut */
+    /* the bug: the next sync (with room on disk again) announced seq 2 durable */
+    CHECK(mx_store_dirty(st) == 0);
+    CHECK(mx_store_sync(st) == MX_STORE_EFAILED && listener_calls == 1 && st->synced_seq == 1);
+    /* read-only: writes are refused (and make the barrier answer them), reads work */
+    errno = 0;
+    CHECK(mx_store_put(st, T_ITEMS, item("after", 3), NULL) == -1 && errno == EROFS);
+    CHECK(mx_store_del(st, T_ITEMS, "ok", NULL) == -1);
+    CHECK(mx_store_dirty(st) == 1);
+    CHECK(mx_store_sync(st) == MX_STORE_EFAILED && mx_store_dirty(st) == 0 && listener_calls == 1);
+    mx_store_health_get(st, &h);
+    CHECK(h.rejected_writes == 2 && h.seq == 2);
+    CHECK(mx_store_get(st, T_ITEMS, "ok") && !mx_store_get(st, T_ITEMS, "after"));
+    /* the catch-up feed never hands out the lost change */
+    sbuf out;
+    sbuf_init(&out);
+    CHECK(changes_since(st, 0, &out) == 0 && strstr(out.data, "\"ok\"") && !strstr(out.data, "\"lost\""));
+    sbuf_free(&out);
+    /* no snapshot of memory that holds the lost batch */
+    char *sp = file_path(dir, "snapshot.json");
+    CHECK(mx_store_compact(st) == -1 && mx_store_compact_bg(st) == -1 && file_size(sp) == -1);
+    free(sp);
+    mx_store_close(st);
+    CHECK(file_size(jp) == before);
+
+    st = open_st(dir, 100);
+    CHECK(st && !mx_store_failed(st) && st->seq == 1 && mx_store_get(st, T_ITEMS, "ok") && !mx_store_get(st, T_ITEMS, "lost"));
+    CHECK(st && mx_store_put(st, T_ITEMS, item("again", 4), NULL) == 0 && mx_store_sync(st) == 0);
+    mx_store_close(st);
+    free(jp);
+    rm_rf(dir);
+}
+
+/* fsyncgate: after a failed fsync nothing is retried or announced. */
+static void t_sticky_fsync_failure(void) {
+    char *dir = make_tmpdir();
+    mx_store *st = open_st(dir, 100);
+    st->listener = count_listener;
+    listener_calls = 0;
+    CHECK(mx_store_put(st, T_ITEMS, item("a", 1), NULL) == 0);
+    st->fault_syncs = 1; /* the fsync of this batch fails */
+    CHECK(mx_store_sync(st) == -1 && mx_store_failed(st) && listener_calls == 0);
+    mx_store_health h;
+    mx_store_health_get(st, &h);
+    CHECK(h.failed && h.fail_op && strcmp(h.fail_op, "fsync") == 0 && h.synced_seq == 0);
+    int64_t fsyncs = st->fsyncs;
+    CHECK(mx_store_sync(st) == MX_STORE_EFAILED && st->fsyncs == fsyncs && listener_calls == 0);
+    CHECK(mx_store_put(st, T_ITEMS, item("b", 2), NULL) == -1);
+    CHECK(mx_store_sync(st) == MX_STORE_EFAILED && listener_calls == 0 && st->synced_seq == 0);
+    mx_store_close(st);
+    st = open_st(dir, 100);
+    CHECK(st && !mx_store_failed(st) && !mx_store_get(st, T_ITEMS, "b"));
+    mx_store_close(st);
+    rm_rf(dir);
+}
+
 void test_store_all(void) {
     RUN(t_hmap);
     RUN(t_append_reload);
@@ -673,4 +765,6 @@ void test_store_all(void) {
     RUN(t_background_compaction);
     RUN(t_indexes);
     RUN(t_crash_points);
+    RUN(t_sticky_write_failure);
+    RUN(t_sticky_fsync_failure);
 }

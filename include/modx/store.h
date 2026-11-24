@@ -163,10 +163,30 @@ struct mx_store {
     int test_crash_compaction; /* testing: the compaction child dies halfway through the snapshot */
     int64_t compactions, compact_failures;
     int64_t last_compact_block_ms; /* how long the last compaction blocked the caller */
-    int fault_syncs;           /* testing: the next N syncs fail like an fsync error would */
+    int fault_syncs;           /* testing: the next sync fails like an fsync error would (the store fails) */
     sbuf pending;              /* group commit: records not written yet */
     int64_t pending_records;
+    /* sticky failure (see mx_store_failed) */
+    int failed;                /* 1 after a journal write / fsync error: read-only until reopened */
+    int fail_errno;            /* errno of that error (0 = injected through fault_syncs) */
+    const char *fail_op;       /* "write" or "fsync" (static string), NULL while healthy */
+    int64_t rejected_writes;   /* mutations refused since the failure */
+    int rejected_pending;      /* a mutation was refused since the last mx_store_sync */
 };
+
+/* mx_store_sync's answer once the store has failed (and mutations' errno = EROFS). */
+#define MX_STORE_EFAILED (-2)
+
+/* Health of the store, for /health or stats endpoints. */
+typedef struct {
+    int failed;                /* 1: read-only after a journal I/O error; reopen (restart) to recover */
+    int fail_errno;
+    const char *fail_op;       /* "write" / "fsync" / NULL */
+    int64_t seq, synced_seq;   /* synced_seq stops moving at the failure */
+    int64_t pending_records;
+    int64_t rejected_writes;
+    int64_t journal_size;
+} mx_store_health;
 
 /* Opens (creating if needed) the data dir, loads the snapshot, replays the
  * journal, truncates a torn/corrupt tail. defs must outlive the store.
@@ -197,7 +217,8 @@ int mx_store_indexed(const mx_store *st, int coll, const char *field);
 /* Mutations: journal, apply in memory, record in the ring (not durable until
  * mx_store_sync). put takes ownership of obj (which needs a string "id"); the
  * key comes from hooks.row_key. del_key removes the row stored under key
- * (id is what the change reports). Return 0, or -1 on I/O error. */
+ * (id is what the change reports). Return 0, or -1 (bad collection / id, or
+ * the store has failed: errno = EROFS, nothing applied; see mx_store_failed). */
 int mx_store_put(mx_store *st, int coll, json *obj, const char *client_id);
 int mx_store_del(mx_store *st, int coll, const char *id, const char *client_id);
 int mx_store_del_key(mx_store *st, int coll, const char *id, const char *key, const char *client_id);
@@ -205,9 +226,22 @@ int mx_store_del_key(mx_store *st, int coll, const char *id, const char *key, co
 /* Group commit: mutations only queue their journal records. mx_store_sync
  * writes everything queued with one write(), fsyncs once and then notifies
  * the listener of every newly durable change. May start a compaction.
- * Returns 0, or -1 on I/O error (nothing of the batch may be reported as
- * durable then). */
+ * Returns 0; -1 when the write or the fsync fails (nothing of the batch is
+ * reported durable, and the store fails: see below); MX_STORE_EFAILED (-2)
+ * on every call after that. */
 int mx_store_sync(mx_store *st);
+/* Sticky failure. A journal write() or fsync() error makes the store
+ * read-only for good: the queued records are dropped, nothing is ever
+ * announced durable again (a later fsync that "succeeds" proves nothing once
+ * one failed), fsync is never retried, mutations return -1 (EROFS) and
+ * compaction is refused (memory still holds the lost batch). Reads keep
+ * working; they may see changes of the failed batch (their writers got an
+ * error: outcome unknown). The catch-up feed stops at synced_seq. Recovery is
+ * a reopen (restart), which replays exactly what reached the disk.
+ * With http_server's barrier a failed commit turns the held responses into
+ * 500s, and requests that tried to write afterwards into 503s. */
+int mx_store_failed(const mx_store *st);
+void mx_store_health_get(const mx_store *st, mx_store_health *h);
 /* Adapters for http_server's durability barrier (ctx = the store). */
 int mx_store_pending_cb(void *st);
 int mx_store_commit_cb(void *st);

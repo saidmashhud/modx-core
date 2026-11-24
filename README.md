@@ -98,6 +98,11 @@ your tree (or add this repository as a submodule) and compile the sources with `
   WebSocket) are sent after the change notifications. If the commit fails the held responses become 500s
   and the queued pushes are dropped. The in-memory state is not rolled back on an I/O error (as before
   group commit): a 500 means "outcome unknown, re-read".
+- **A failed commit is sticky.** After a journal `write()` or `fsync()` error the store is read-only until
+  it is reopened: nothing is ever announced durable again, `fsync()` is never retried (a later one that
+  "succeeds" proves nothing once one failed), mutations are refused (the barrier answers them with 503),
+  and compaction is refused. Reads keep working. `mx_store_failed()` / `mx_store_health_get()` expose the
+  state; a restart replays exactly what reached the disk.
 - **Recovery.** A record is `<crc32 hex> <json>\n`. On open the journal is replayed up to the first record
   that is torn, fails its CRC or does not parse; the tail is cut off and logged. A snapshot that does not
   parse is a fatal error (never silently empty). Tests cut the journal at every byte offset.

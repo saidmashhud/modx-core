@@ -75,6 +75,12 @@ static void reply_err(http_response *resp, int status, const char *code) {
     sbuf_printf(&resp->body, "{\"error\":{\"code\":\"%s\"}}", code);
 }
 
+/* a failed store is read-only until restarted: 503, not 500 */
+static void storage_err(app *a, http_response *resp) {
+    if (mx_store_failed(a->st)) reply_err(resp, 503, "storage_read_only");
+    else reply_err(resp, 500, "storage");
+}
+
 static int cmp_updated_desc(const void *a, const void *b) {
     double x = json_get_num(*(const json *const *)a, "updated_at", 0);
     double y = json_get_num(*(const json *const *)b, "updated_at", 0);
@@ -134,7 +140,7 @@ static void create_todo(app *a, const http_request *req, http_response *resp) {
     json_set(row, "updated_at", json_num((double)now_ms()));
     json_free(b);
     if (mx_store_put(a->st, C_TODOS, row, http_req_header(req, "x-client-id")) != 0)
-        reply_err(resp, 500, "storage");
+        storage_err(a, resp);
     else write_row(a, resp, 201, id);
     free(id);
 }
@@ -152,7 +158,7 @@ static void update_todo(app *a, const http_request *req, http_response *resp, co
     json_set(row, "updated_at", json_num((double)now_ms()));
     json_free(b);
     if (mx_store_put(a->st, C_TODOS, row, http_req_header(req, "x-client-id")) != 0)
-        reply_err(resp, 500, "storage");
+        storage_err(a, resp);
     else write_row(a, resp, 200, id);
 }
 
@@ -193,7 +199,12 @@ static void handle(http_server *srv, http_conn *c, const http_request *req, http
         else reply_err(resp, 404, "not_found");
         return;
     }
-    if (get && strcmp(p, "/api/health") == 0) { reply_json(resp, 200, "{\"ok\":true}"); return; }
+    if (get && strcmp(p, "/api/health") == 0) {
+        /* a store that failed serves reads but refuses writes until restarted */
+        if (mx_store_failed(a->st)) reply_json(resp, 503, "{\"ok\":false,\"store\":\"read_only\"}");
+        else reply_json(resp, 200, "{\"ok\":true}");
+        return;
+    }
     if (get && strcmp(p, "/api/events") == 0) { open_events(a, c, req, resp); return; }
     if (get && strcmp(p, "/api/ws") == 0) {
         int st = mx_ws_accept(c, req, resp, NULL, NULL);
@@ -210,6 +221,11 @@ static void handle(http_server *srv, http_conn *c, const http_request *req, http
                     (long long)st->compactions, st->compact_pid > 0 ? "true" : "false");
         sbuf_printf(o, "\"fsyncs\":%lld,\"max_batch\":%lld,\"poller\":\"%s\",", (long long)st->fsyncs,
                     (long long)st->max_batch, http_server_poller(srv));
+        mx_store_health h;
+        mx_store_health_get(st, &h);
+        sbuf_printf(o, "\"store_failed\":%s,\"store_fail_op\":\"%s\",\"synced_seq\":%lld,\"rejected_writes\":%lld,",
+                    h.failed ? "true" : "false", h.fail_op ? h.fail_op : "", (long long)h.synced_seq,
+                    (long long)h.rejected_writes);
         sbuf_printf(o, "\"gzip_in\":%lld,\"gzip_out\":%lld,\"cache_hits\":%lld,\"cache_misses\":%lld,",
                     (long long)srv->gzip_in, (long long)srv->gzip_out, (long long)a->cache.hits, (long long)a->cache.misses);
         sbuf_printf(o, "\"timeouts\":%lld,\"conns\":%zu,\"peak_conns\":%zu,\"streams\":%zu,\"max_rss_kb\":%ld}",
@@ -279,7 +295,7 @@ static void handle(http_server *srv, http_conn *c, const http_request *req, http
             update_todo(a, req, resp, id);
         } else if (strcmp(m, "DELETE") == 0) {
             if (!mx_store_get(a->st, C_TODOS, id)) { reply_err(resp, 404, "not_found"); return; }
-            if (mx_store_del(a->st, C_TODOS, id, NULL) != 0) reply_err(resp, 500, "storage");
+            if (mx_store_del(a->st, C_TODOS, id, NULL) != 0) storage_err(a, resp);
             else resp->status = 204;
         } else {
             reply_err(resp, 405, "method_not_allowed");

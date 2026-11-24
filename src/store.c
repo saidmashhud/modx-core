@@ -319,6 +319,7 @@ static int fsync_dir(const char *dir) {
 
 static int flush_pending(mx_store *st);
 static void compact_done(mx_store *st, int status);
+static void store_fail(mx_store *st, const char *op, int err);
 
 /* ---------------- ring ---------------- */
 
@@ -632,8 +633,7 @@ void mx_store_close(mx_store *st) {
         compact_done(st, status);
     }
     if (st->journal_fd >= 0) {
-        flush_pending(st);
-        fsync(st->journal_fd);
+        if (!st->failed && flush_pending(st) == 0) fsync(st->journal_fd);
         close(st->journal_fd);
     }
     for (size_t i = 0; i < st->ring_len; i++) change_free(st, &st->ring[(st->ring_start + i) % st->ring_cap]);
@@ -680,6 +680,14 @@ const json **mx_store_all(const mx_store *st, int coll, size_t *n) {
 static int commit(mx_store *st, int coll, const char *op, const char *id, const char *key_in, json *data,
                   const char *client_id) {
     if (coll < 0 || coll >= st->ncoll) { json_free(data); return -1; }
+    if (st->failed) {
+        /* read-only after a journal I/O error: nothing more is accepted */
+        json_free(data);
+        st->rejected_writes++;
+        st->rejected_pending = 1;
+        errno = EROFS;
+        return -1;
+    }
     int64_t seq = st->seq + 1;
     int64_t ts = now_ms();
     char *key = key_in ? xstrdup(key_in) : key_for(st, coll, id, NULL, data);
@@ -737,17 +745,51 @@ int mx_store_del(mx_store *st, int coll, const char *id, const char *client_id) 
     return mx_store_del_key(st, coll, id, NULL, client_id);
 }
 
-int mx_store_dirty(const mx_store *st) { return st->synced_seq != st->seq; }
+/* Failed: only a rejected mutation is "pending" (so the barrier answers the
+ * request that made it); the failed batch never becomes durable. */
+int mx_store_dirty(const mx_store *st) { return st->failed ? st->rejected_pending : st->synced_seq != st->seq; }
+
+int mx_store_failed(const mx_store *st) { return st->failed; }
+
+void mx_store_health_get(const mx_store *st, mx_store_health *h) {
+    memset(h, 0, sizeof *h);
+    h->failed = st->failed;
+    h->fail_errno = st->fail_errno;
+    h->fail_op = st->fail_op;
+    h->seq = st->seq;
+    h->synced_seq = st->synced_seq;
+    h->pending_records = st->pending_records;
+    h->rejected_writes = st->rejected_writes;
+    h->journal_size = st->journal_size;
+}
+
+/* A journal write or fsync failed. After a failed fsync the kernel may have
+ * dropped the dirty pages and cleared the error, so a later fsync "succeeding"
+ * proves nothing (fsyncgate); after a failed write the records are gone. Either
+ * way the changes of the batch, and everything after them, can never be
+ * reported durable: the store becomes read-only (sticky) until it is reopened,
+ * which replays exactly what reached the disk. */
+static void store_fail(mx_store *st, const char *op, int err) {
+    if (st->failed) return;
+    st->failed = 1;
+    st->fail_op = op;
+    st->fail_errno = err;
+    st->pending.len = 0;
+    st->pending_records = 0;
+    fprintf(stderr, "modx: store is read-only after a journal %s failure (%s); reopen to recover\n", op,
+            err ? strerror(err) : "injected fault");
+}
 
 /* Write the pending records (one write). On failure the partial tail is cut
- * so later appends stay parseable. */
+ * so the file stays parseable, and the store fails (read-only). */
 static int flush_pending(mx_store *st) {
+    if (st->failed) return -1;
     if (!st->pending.len) return 0;
     if (write_all(st->journal_fd, st->pending.data, st->pending.len) != 0) {
-        fprintf(stderr, "modx: journal write failed: %s\n", strerror(errno));
+        int e = errno;
         if (ftruncate(st->journal_fd, (off_t)st->journal_size) != 0) { /* recovery cuts it */ }
-        st->pending.len = 0;
-        st->pending_records = 0;
+        store_fail(st, "write", e);
+        errno = e;
         return -1;
     }
     st->journal_size += (int64_t)st->pending.len;
@@ -759,16 +801,21 @@ static int flush_pending(mx_store *st) {
 }
 
 int mx_store_sync(mx_store *st) {
+    if (st->failed) {
+        st->rejected_pending = 0;
+        errno = EROFS;
+        return MX_STORE_EFAILED;
+    }
     if (st->synced_seq == st->seq) return 0;
     int64_t batch = st->seq - st->synced_seq;
     if (st->fault_syncs > 0) {
         st->fault_syncs--;
-        fprintf(stderr, "modx: journal fsync failed: injected fault\n");
+        store_fail(st, "fsync", 0);
         return -1;
     }
     if (flush_pending(st) != 0) return -1;
     if (fsync(st->journal_fd) != 0) {
-        fprintf(stderr, "modx: journal fsync failed: %s\n", strerror(errno));
+        store_fail(st, "fsync", errno); /* never retried */
         return -1;
     }
     st->fsyncs++;
@@ -863,10 +910,13 @@ static void compact_done(mx_store *st, int status) {
 
 int mx_store_compact_bg(mx_store *st) {
     if (st->compact_pid > 0) return 1;
+    /* a failed store must not write its memory (which holds the lost batch) as a snapshot */
+    if (st->failed) return -1;
     /* a previous background run failed: its rotated journal must be covered first */
     if (access(st->journal_old_path, F_OK) == 0) return mx_store_compact(st);
     int64_t t0 = mono_ms();
-    if (flush_pending(st) != 0 || fsync(st->journal_fd) != 0) return -1;
+    if (flush_pending(st) != 0) return -1;
+    if (fsync(st->journal_fd) != 0) { store_fail(st, "fsync", errno); return -1; }
     if (st->hooks.before_snapshot) st->hooks.before_snapshot(st->hooks.ctx, st);
     /* rotate: journal.log -> journal.old (records <= seq), fresh journal.log for what follows */
     if (rename(st->journal_path, st->journal_old_path) != 0) return -1;
@@ -906,6 +956,7 @@ int mx_store_compact(mx_store *st) {
         while (waitpid(st->compact_pid, &status, 0) < 0 && errno == EINTR) {}
         compact_done(st, status);
     }
+    if (st->failed) return -1; /* its memory holds changes that never reached the disk */
     /* records not written yet would be lost by the truncate below: they are in
      * memory (and so in the snapshot), but write them anyway so a failed
      * snapshot leaves the journal complete */

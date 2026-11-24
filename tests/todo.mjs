@@ -182,10 +182,27 @@ try {
     check(gc.length === 200 && rs.every((r) => gc.some((g) => g.id === r.json.id)), 'every acknowledged write survived kill -9', gc.length);
     // a failing commit turns the responses it held into 500s, and nothing is broadcast
     check((await api('POST', '/api/fault')).status === 200, 'fault armed');
+    const live = sse('/api/events');
+    await until(() => live.st.head);
     const bad = await api('POST', '/api/todos', { title: 'not durable' });
     check(bad.status === 500 && bad.json?.error?.code === 'internal', 'held response replaced by 500', bad.status);
+    // the failure is sticky: the store is read-only, later writes get 503 and nothing is ever announced durable
+    const ro = await api('POST', '/api/todos', { title: 'refused', list: 'gc2' });
+    check(ro.status === 503, 'writes after a failed commit get 503', ro.status);
+    check((await api('GET', '/api/todos?limit=1')).status === 200, 'reads still served');
+    check((await api('GET', '/api/health')).status === 503, 'health reports the read-only store');
+    const sf = (await api('GET', '/api/stats')).json;
+    check(sf.store_failed === true && sf.store_fail_op === 'fsync' && sf.rejected_writes >= 1 && sf.synced_seq < sf.seq, 'stats expose the failure', sf);
+    await sleep(100);
+    check(!live.events.some((e) => e.data?.includes('not durable') || e.data?.includes('refused')), 'nothing of the failed batch was broadcast');
+    live.close();
+    // a restart replays exactly what reached the disk
+    await stop();
+    await start();
+    check((await api('GET', '/api/health')).status === 200, 'healthy after restart');
+    check(!(await api('GET', '/api/todos?limit=1000')).json.some((t) => t.title === 'not durable' || t.title === 'refused'), 'the failed batch is gone after restart');
     const ok = await api('POST', '/api/todos', { title: 'durable again', list: 'gc2' });
-    check(ok.status === 201, 'next commit succeeds');
+    check(ok.status === 201, 'commits succeed after restart');
     for (const r of [...rs, ok]) await api('DELETE', `/api/todos/${r.json.id}`);
     const left = (await api('GET', '/api/todos?limit=1000')).json.filter((t) => t.title !== 'not durable');
     check(left.length === 1, 'cleanup', left.length);
