@@ -44,6 +44,13 @@ static void t_origin_ct(void) {
 }
 
 
+/* 1 when the exact key is stored */
+static int rl_find_for_test(const ratelimit *rl, const char *key) {
+    for (size_t i = 0; i < rl->n; i++)
+        if (strcmp(rl->entries[i].ip, key) == 0) return 1;
+    return 0;
+}
+
 static void t_ratelimit(void) {
     ratelimit rl;
     rl_init(&rl);
@@ -59,9 +66,83 @@ static void t_ratelimit(void) {
     rl_fail(&rl, "9.9.9.9", t);
     rl_reset(&rl, "1.2.3.4");
     CHECK(!rl_blocked(&rl, "1.2.3.4", t + 30));
-    /* stale entries are pruned when new IPs arrive */
-    rl_fail(&rl, "10.0.0.1", t + 3 * MX_RL_WINDOW_MS);
-    CHECK(rl.n == 1);
+    /* a reset forgets the key */
+    CHECK(rl.n == 1 && !rl_find_for_test(&rl, "1.2.3.4") && rl_find_for_test(&rl, "9.9.9.9"));
+    rl_free(&rl);
+}
+
+/* The table is bounded: aged-out keys go first, then the oldest unblocked one. */
+static void t_ratelimit_bounded(void) {
+    ratelimit rl;
+    rl_init_cap(&rl, 64);
+    int64_t t = 5000000;
+    char ip[32];
+    /* one blocked key, then far more distinct keys than fit */
+    for (int i = 0; i < MX_RL_MAX_FAILS; i++) rl_fail(&rl, "6.6.6.6", t);
+    for (int i = 0; i < 100000; i++) {
+        snprintf(ip, sizeof ip, "10.%d.%d.%d", (i >> 16) & 255, (i >> 8) & 255, i & 255);
+        rl_fail(&rl, ip, t + 1 + i); /* distinct times: "oldest" is well defined */
+    }
+    CHECK(rl.n == 64 && rl.cap == 64);
+    CHECK(rl.evictions == 100000 - 63);
+    const int64_t t2 = t + 200000;
+    CHECK(rl_blocked(&rl, "6.6.6.6", t2)); /* unblocked keys were evicted, not the blocked one */
+    /* the most recent keys are still there, and the index finds them (no duplicates) */
+    int found = 0;
+    for (int i = 100000 - 63; i < 100000; i++) {
+        snprintf(ip, sizeof ip, "10.%d.%d.%d", (i >> 16) & 255, (i >> 8) & 255, i & 255);
+        found += rl_find_for_test(&rl, ip);
+        for (int k = 1; k < MX_RL_MAX_FAILS; k++) rl_fail(&rl, ip, t2);
+        found += rl_blocked(&rl, ip, t2);
+    }
+    CHECK(found == 2 * 63 && rl.n == 64 && rl.evictions == 100000 - 63);
+    /* blocking still works for a key that fits */
+    /* full and every key blocked: the oldest blocked one (6.6.6.6) makes room */
+    for (int i = 0; i < MX_RL_MAX_FAILS; i++) rl_fail(&rl, "7.7.7.7", t2 + 100);
+    CHECK(rl_blocked(&rl, "7.7.7.7", t2 + 100) && rl.n == 64 && !rl_blocked(&rl, "6.6.6.6", t2 + 100));
+    /* once the window passed, a new key makes room by dropping every aged-out one (no eviction) */
+    int64_t ev = rl.evictions;
+    rl_fail(&rl, "8.8.8.8", t2 + 100 + MX_RL_WINDOW_MS);
+    CHECK(rl.n == 1 && rl.evictions == ev && !rl_blocked(&rl, "7.7.7.7", t2 + 100 + MX_RL_WINDOW_MS));
+    /* removals keep the index consistent: reset every other key, the rest are found */
+    for (int i = 0; i < 60; i++) {
+        snprintf(ip, sizeof ip, "k%d", i);
+        rl_fail(&rl, ip, t2 + 200 + MX_RL_WINDOW_MS);
+    }
+    for (int i = 0; i < 60; i += 2) {
+        snprintf(ip, sizeof ip, "k%d", i);
+        rl_reset(&rl, ip);
+    }
+    CHECK(rl.n == 31);
+    found = 0;
+    for (int i = 1; i < 60; i += 2) {
+        snprintf(ip, sizeof ip, "k%d", i);
+        for (int k = 1; k < MX_RL_MAX_FAILS; k++) rl_fail(&rl, ip, t2 + 300 + MX_RL_WINDOW_MS);
+        found += rl_blocked(&rl, ip, t2 + 300 + MX_RL_WINDOW_MS);
+    }
+    CHECK(found == 30 && rl.n == 31);
+    for (int i = 0; i < 60; i += 2) {
+        snprintf(ip, sizeof ip, "k%d", i);
+        found += rl_find_for_test(&rl, ip) || rl_blocked(&rl, ip, t2 + 300 + MX_RL_WINDOW_MS);
+    }
+    CHECK(found == 30);
+    /* every key is blocked: the oldest blocked one goes */
+    rl_free(&rl);
+    rl_init_cap(&rl, 4);
+    for (int k = 0; k < 4; k++) {
+        snprintf(ip, sizeof ip, "b%d", k);
+        for (int i = 0; i < MX_RL_MAX_FAILS; i++) rl_fail(&rl, ip, t + k);
+    }
+    rl_fail(&rl, "new", t + 10);
+    CHECK(rl.n == 4 && !rl_blocked(&rl, "b0", t + 10) && rl_blocked(&rl, "b1", t + 10) && rl.evictions == 1);
+    /* long keys are truncated consistently */
+    char longkey[200];
+    memset(longkey, 'z', sizeof longkey - 1);
+    longkey[sizeof longkey - 1] = 0;
+    for (int i = 0; i < MX_RL_MAX_FAILS; i++) rl_fail(&rl, longkey, t + 20);
+    CHECK(rl_blocked(&rl, longkey, t + 20));
+    rl_reset(&rl, longkey);
+    CHECK(!rl_blocked(&rl, longkey, t + 20));
     rl_free(&rl);
 }
 
@@ -85,5 +166,6 @@ void test_session_all(void) {
     RUN(t_cookie);
     RUN(t_origin_ct);
     RUN(t_ratelimit);
+    RUN(t_ratelimit_bounded);
     RUN(t_xff_token);
 }

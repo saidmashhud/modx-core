@@ -79,13 +79,60 @@ int content_type_is_json(const char *ct) {
     return *rest == 0 || *rest == ';';
 }
 
-void rl_init(ratelimit *rl) { rl->entries = NULL; rl->n = 0; rl->cap = 0; }
-void rl_free(ratelimit *rl) { free(rl->entries); rl_init(rl); }
+void rl_init(ratelimit *rl) { rl_init_cap(rl, 0); }
 
-static rl_entry *rl_find(ratelimit *rl, const char *ip) {
-    for (size_t i = 0; i < rl->n; i++)
-        if (strcmp(rl->entries[i].ip, ip) == 0) return &rl->entries[i];
-    return NULL;
+void rl_init_cap(ratelimit *rl, size_t max_keys) {
+    memset(rl, 0, sizeof *rl);
+    rl->max = max_keys;
+}
+
+void rl_free(ratelimit *rl) {
+    free(rl->entries);
+    free(rl->index);
+    rl_init_cap(rl, rl->max);
+}
+
+static uint64_t rl_hash(const char *s) {
+    uint64_t h = 1469598103934665603ULL;
+    for (; *s; s++) { h ^= (unsigned char)*s; h *= 1099511628211ULL; }
+    return h;
+}
+
+/* Index slot holding key, or the empty slot where it would go. */
+static size_t rl_slot(const ratelimit *rl, const char *key) {
+    size_t mask = rl->index_cap - 1;
+    size_t i = (size_t)rl_hash(key) & mask;
+    while (rl->index[i] && strcmp(rl->entries[rl->index[i] - 1].ip, key) != 0) i = (i + 1) & mask;
+    return i;
+}
+
+static rl_entry *rl_find(ratelimit *rl, const char *key) {
+    if (!rl->index) return NULL;
+    uint32_t v = rl->index[rl_slot(rl, key)];
+    return v ? &rl->entries[v - 1] : NULL;
+}
+
+/* Removes the entry at dense position d (backward-shift deletion in the index,
+ * the last entry moves into the hole). */
+static void rl_remove_at(ratelimit *rl, size_t d) {
+    size_t mask = rl->index_cap - 1;
+    size_t i = rl_slot(rl, rl->entries[d].ip), j = i;
+    for (;;) {
+        j = (j + 1) & mask;
+        if (!rl->index[j]) break;
+        size_t k = (size_t)rl_hash(rl->entries[rl->index[j] - 1].ip) & mask;
+        /* the entry at j may stay if its home k lies cyclically in (i, j] */
+        if (i <= j ? (i < k && k <= j) : (i < k || k <= j)) continue;
+        rl->index[i] = rl->index[j];
+        i = j;
+    }
+    rl->index[i] = 0;
+    size_t last = rl->n - 1;
+    if (d != last) {
+        rl->entries[d] = rl->entries[last];
+        rl->index[rl_slot(rl, rl->entries[d].ip)] = (uint32_t)(d + 1);
+    }
+    rl->n--;
 }
 
 static int recent_fails(const rl_entry *e, int64_t now) {
@@ -95,35 +142,68 @@ static int recent_fails(const rl_entry *e, int64_t now) {
     return k;
 }
 
+/* What is stored for a key (truncated to fit rl_entry.ip). */
+static void rl_key(const char *ip, char key[64]) { snprintf(key, 64, "%s", ip); }
+
 int rl_blocked(ratelimit *rl, const char *ip, int64_t now) {
-    rl_entry *e = rl_find(rl, ip);
+    char key[sizeof rl->entries[0].ip];
+    rl_key(ip, key);
+    rl_entry *e = rl_find(rl, key);
     return e && recent_fails(e, now) >= MX_RL_MAX_FAILS;
 }
 
-void rl_fail(ratelimit *rl, const char *ip, int64_t now) {
-    rl_entry *e = rl_find(rl, ip);
-    if (!e) {
-        /* drop entries whose failures have all aged out before growing */
-        size_t k = 0;
-        for (size_t i = 0; i < rl->n; i++)
-            if (recent_fails(&rl->entries[i], now) > 0) rl->entries[k++] = rl->entries[i];
-        rl->n = k;
-        if (rl->n == rl->cap) {
-            rl->cap = rl->cap ? rl->cap * 2 : 16;
-            rl->entries = xrealloc(rl->entries, rl->cap * sizeof *rl->entries);
+/* Full: drop every aged-out key; if that frees nothing, evict the key with
+ * the oldest last failure, a blocked one only when every key is blocked. */
+static void rl_make_room(ratelimit *rl, int64_t now) {
+    for (size_t d = rl->n; d-- > 0;)
+        if (now - rl->entries[d].last >= MX_RL_WINDOW_MS) rl_remove_at(rl, d);
+    if (rl->n < rl->cap) return;
+    size_t victim = 0;
+    int victim_blocked = 1;
+    for (size_t d = 0; d < rl->n; d++) {
+        const rl_entry *e = &rl->entries[d];
+        int b = recent_fails(e, now) >= MX_RL_MAX_FAILS;
+        if (d == 0 || (victim_blocked && !b) || (b == victim_blocked && e->last < rl->entries[victim].last)) {
+            victim = d;
+            victim_blocked = b;
         }
-        e = &rl->entries[rl->n++];
+    }
+    rl_remove_at(rl, victim);
+    rl->evictions++;
+}
+
+void rl_fail(ratelimit *rl, const char *ip, int64_t now) {
+    if (!rl->entries) {
+        rl->cap = rl->max ? rl->max : MX_RL_CAPACITY;
+        if (rl->cap > UINT32_MAX / 4) rl->cap = UINT32_MAX / 4;
+        rl->index_cap = 16;
+        while (rl->index_cap < rl->cap * 2) rl->index_cap *= 2;
+        rl->entries = xcalloc(rl->cap, sizeof *rl->entries);
+        rl->index = xcalloc(rl->index_cap, sizeof *rl->index);
+    }
+    char key[sizeof rl->entries[0].ip];
+    rl_key(ip, key);
+    rl_entry *e = rl_find(rl, key);
+    if (!e) {
+        if (rl->n == rl->cap) rl_make_room(rl, now);
+        size_t slot = rl_slot(rl, key);
+        e = &rl->entries[rl->n];
         memset(e, 0, sizeof *e);
-        snprintf(e->ip, sizeof e->ip, "%s", ip);
+        memcpy(e->ip, key, sizeof key);
+        rl->index[slot] = (uint32_t)(++rl->n);
     }
     e->fails[e->next] = now;
     e->next = (e->next + 1) % MX_RL_MAX_FAILS;
     if (e->count < MX_RL_MAX_FAILS) e->count++;
+    e->last = now;
 }
 
 void rl_reset(ratelimit *rl, const char *ip) {
-    rl_entry *e = rl_find(rl, ip);
-    if (e) { e->count = 0; e->next = 0; }
+    if (!rl->index) return;
+    char key[sizeof rl->entries[0].ip];
+    rl_key(ip, key);
+    uint32_t v = rl->index[rl_slot(rl, key)];
+    if (v) rl_remove_at(rl, v - 1);
 }
 
 int xff_rightmost(const char *header, char *out, size_t outcap) {

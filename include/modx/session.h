@@ -29,24 +29,39 @@ int content_type_is_json(const char *ct);
  * back to the socket peer). */
 int xff_rightmost(const char *header, char *out, size_t outcap);
 
-/* Failure throttling: per-key (usually per-IP) timestamps of recent failures. */
+/* Failure throttling: per-key (usually per-IP) timestamps of recent failures.
+ * Bounded: at most `cap` keys (MX_RL_CAPACITY unless rl_init_cap says
+ * otherwise; about 160 bytes each, allocated on the first failure), found
+ * through a hash index. When it is full, keys whose failures have all aged
+ * out are dropped first; if none has, the key with the oldest last failure
+ * is evicted, preferring keys that are not blocked. */
+#define MX_RL_CAPACITY 4096
+
 typedef struct {
-    char ip[64];
+    char ip[64];                    /* the key (truncated to 63 bytes) */
     int64_t fails[MX_RL_MAX_FAILS]; /* ring of the last N failure times */
     int count;                      /* valid entries (<= MX_RL_MAX_FAILS) */
     int next;
+    int64_t last;                   /* latest failure */
 } rl_entry;
 
 typedef struct {
-    rl_entry *entries;
-    size_t n, cap;
+    rl_entry *entries;  /* n used of cap (dense) */
+    size_t n, cap;      /* cap: most keys kept (0 until the first failure, then fixed) */
+    uint32_t *index;    /* open addressing, entry position + 1 (0 = empty) */
+    size_t index_cap;   /* power of two, >= 2 * cap */
+    size_t max;         /* capacity asked for (0 = MX_RL_CAPACITY) */
+    int64_t evictions;  /* keys dropped while still inside the window to make room */
 } ratelimit;
 
 void rl_init(ratelimit *rl);
+/* Like rl_init with a capacity other than MX_RL_CAPACITY (keys). */
+void rl_init_cap(ratelimit *rl, size_t max_keys);
 void rl_free(ratelimit *rl);
 /* 1 when key already has MX_RL_MAX_FAILS failures inside the window. */
 int rl_blocked(ratelimit *rl, const char *key, int64_t now);
 void rl_fail(ratelimit *rl, const char *key, int64_t now);
+/* Forgets key (e.g. after a successful login). */
 void rl_reset(ratelimit *rl, const char *key);
 
 /* A new random session token (64 lowercase hex chars) and the hex SHA-256 of
