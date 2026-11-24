@@ -260,6 +260,18 @@ long http_parse_request_need(const char *buf, size_t len, http_request *req, int
 
 static void poller_add(http_server *srv, http_conn *c);
 
+/* Writes to a peer that has gone must not raise SIGPIPE (which kills a
+ * process that did not ignore it): MSG_NOSIGNAL per call where it exists
+ * (Linux, the BSDs, recent macOS), SO_NOSIGPIPE on the socket as well where
+ * that exists (macOS / BSD, set in accept_all). */
+static ssize_t sock_send(int fd, const void *p, size_t n) {
+#ifdef MSG_NOSIGNAL
+    return send(fd, p, n, MSG_NOSIGNAL);
+#else
+    return write(fd, p, n);
+#endif
+}
+
 static int set_nonblock(int fd) {
     int fl = fcntl(fd, F_GETFL, 0);
     if (fl < 0) return -1;
@@ -458,7 +470,7 @@ static void conn_flush(http_conn *c) {
     if (c->held) return; /* waits for the durability barrier */
     for (;;) {
         while (c->out_off < c->out.len) {
-            ssize_t w = write(c->fd, c->out.data + c->out_off, c->out.len - c->out_off);
+            ssize_t w = sock_send(c->fd, c->out.data + c->out_off, c->out.len - c->out_off);
             if (w < 0) {
                 if (errno == EINTR) continue;
                 if (errno == EAGAIN || errno == EWOULDBLOCK) return;
@@ -582,7 +594,7 @@ static void timeouts(http_server *srv, int64_t now) {
             int64_t limit = c->need ? body : hdr; /* need is set once the headers are parsed */
             if (now - c->req_start > limit) {
                 static const char msg[] = "HTTP/1.1 408 Request Timeout\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                ssize_t w = write(c->fd, msg, sizeof msg - 1);
+                ssize_t w = sock_send(c->fd, msg, sizeof msg - 1);
                 (void)w;
                 c->dead = 1;
                 srv->timeouts++;
@@ -879,7 +891,7 @@ void http_server_close(http_server *srv) {
         http_conn *c = srv->conns[i];
         /* best-effort, non-blocking flush of pending output */
         if (c->out.len > c->out_off && !c->dead) {
-            ssize_t w = write(c->fd, c->out.data + c->out_off, c->out.len - c->out_off);
+            ssize_t w = sock_send(c->fd, c->out.data + c->out_off, c->out.len - c->out_off);
             (void)w;
         }
         conn_free(srv, c);
