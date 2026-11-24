@@ -16,7 +16,7 @@ LDLIBS   += -lm
 
 BUILD    ?= build
 SRC      := src/util.c src/json.c src/crypto.c src/http.c src/sse.c src/static.c src/ot.c \
-            src/session.c src/store.c src/timer.c src/cache.c src/gzip.c src/ws.c src/idem.c
+            src/session.c src/store.c src/timer.c src/cache.c src/gzip.c src/ws.c src/idem.c src/version.c
 OBJ      := $(SRC:src/%.c=$(BUILD)/%.o)
 LIB      := $(BUILD)/libmodxcore.a
 TEST_SRC := $(wildcard tests/test_*.c)

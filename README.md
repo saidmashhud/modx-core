@@ -31,6 +31,7 @@ bench/          load generator + driver   examples/todo  a complete server on th
 | OT | `ot.h` | plain-text operational transformation (UTF-16 offsets, compatible with ot.js) |
 | Timers | `timer.h` | periodic jobs for the loop tick |
 | gzip | `gzip.h` | zlib deflate / inflate, `Accept-Encoding` parsing |
+| Version | `version.h` | `MODX_VERSION` (`"0.2.0"`), major / minor / patch macros, `modx_version()` |
 
 ## Quick start
 
