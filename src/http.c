@@ -125,6 +125,14 @@ void http_request_free(http_request *r) {
     memset(r, 0, sizeof *r);
 }
 
+/* RFC 9110 5.6.2 tchar */
+static int is_tchar(unsigned char c) {
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) return 1;
+    return c && strchr("!#$%&'*+-.^_`|~", c) != NULL;
+}
+
+static int is_ctl(unsigned char c) { return c < 0x20 || c == 0x7f; }
+
 static const char *find_crlfcrlf(const char *buf, size_t len) {
     if (len < 4) return NULL;
     for (size_t i = 0; i + 3 < len; i++)
@@ -150,6 +158,12 @@ long http_parse_request_need(const char *buf, size_t len, http_request *req, int
     if (!end) return len > HTTP_MAX_HEADER ? -431 : 0;
     size_t head_len = (size_t)(end - buf) + 4;
     if (head_len > HTTP_MAX_HEADER) return -431;
+    /* lines end in CRLF only: a bare CR or LF is a framing ambiguity between
+     * us and a proxy (request smuggling), never tolerated */
+    for (size_t i = 0; i < head_len; i++) {
+        if (buf[i] == '\r' && buf[i + 1] != '\n') return -400;
+        if (buf[i] == '\n' && (i == 0 || buf[i - 1] != '\r')) return -400;
+    }
 
     /* request line */
     const char *line_end = memchr(buf, '\r', head_len);
@@ -166,6 +180,8 @@ long http_parse_request_need(const char *buf, size_t len, http_request *req, int
     memcpy(req->method, buf, (size_t)(sp1 - buf));
     req->method[sp1 - buf] = 0;
     for (char *m = req->method; *m; m++) if (!isupper((unsigned char)*m)) return -400;
+    for (const char *t = sp1 + 1; t < sp2; t++)
+        if (is_ctl((unsigned char)*t)) return -400;
     req->target = xstrndup(sp1 + 1, (size_t)(sp2 - sp1 - 1));
     if (req->target[0] != '/') { http_request_free(req); return -400; }
     char *qm = strchr(req->target, '?');
@@ -184,6 +200,12 @@ long http_parse_request_need(const char *buf, size_t len, http_request *req, int
         if (!le || le == p) break;
         const char *colon = memchr(p, ':', (size_t)(le - p));
         if (!colon || colon == p) { http_request_free(req); return -400; }
+        /* field-name = token (RFC 9110 5.1): "Content-Length : 5" or an obs-fold
+         * line is an error, not a header to ignore (RFC 9112 5.1, 5.2) */
+        for (const char *t = p; t < colon; t++)
+            if (!is_tchar((unsigned char)*t)) { http_request_free(req); return -400; }
+        for (const char *t = colon + 1; t < le; t++)
+            if (is_ctl((unsigned char)*t) && *t != '\t') { http_request_free(req); return -400; }
         char *name = xstrndup(p, (size_t)(colon - p));
         for (char *c = name; *c; c++) *c = (char)tolower((unsigned char)*c);
         const char *v = colon + 1;

@@ -119,6 +119,21 @@ function wsRaw(path = '/api/ws', { key = randomBytes(16).toString('base64'), ver
   st.end = () => sock.destroy();
   return st;
 }
+// One raw connection: send the bytes, collect everything until the server closes (or ms pass).
+function rawOnce(bytes, ms = 2000) {
+  return new Promise((res) => {
+    const u = new URL(base);
+    const s = net.connect(Number(u.port), u.hostname);
+    let got = '';
+    const t = setTimeout(() => { s.destroy(); res({ got, closed: false }); }, ms);
+    s.on('data', (d) => { got += d; });
+    s.on('error', () => {});
+    s.on('close', () => { clearTimeout(t); res({ got, closed: true }); });
+    s.write(bytes);
+  });
+}
+const statuses = (got) => [...got.matchAll(/HTTP\/1\.1 (\d{3})/g)].map((m) => Number(m[1]));
+
 async function until(fn, ms = 3000) { const t = Date.now(); while (Date.now() - t < ms) { if (fn()) return true; await sleep(20); } return false; }
 
 try {
@@ -149,6 +164,21 @@ try {
   check((await api('GET', '/api/todos')).json.length === 2, 'list all');
   check((await api('DELETE', `/api/todos/${id}`)).status === 204, 'delete');
   check((await api('GET', `/api/todos/${id}`)).status === 404, 'deleted');
+
+  section('strict request framing (smuggling)');
+  {
+    // "Content-Length : N" used to be ignored, so the body was parsed as a second, pipelined request
+    const smug = 'POST /api/todos HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length : 37\r\n\r\n' +
+      'GET /api/todos?list=smuggled HTTP/1.1\r\nHost: x\r\n\r\n';
+    const r1 = await rawOnce(smug);
+    check(r1.closed && statuses(r1.got).join() === '400', 'space before colon: one 400, connection closed', r1.got.slice(0, 80));
+    const r2 = await rawOnce('GET /api/health HTTP/1.1\r\nHost: x\r\nX: a\rContent-Length: 0\r\n\r\nGET /api/health HTTP/1.1\r\nHost: x\r\n\r\n');
+    check(r2.closed && statuses(r2.got).join() === '400', 'bare CR: one 400', r2.got.slice(0, 80));
+    const r3 = await rawOnce('GET /api/health HTTP/1.1\r\nHost: x\r\nX: a\x01\r\n\r\n');
+    check(statuses(r3.got).join() === '400', 'control character in a value: 400');
+    const r4 = await rawOnce('GET /api/health HTTP/1.1\r\nHost: x\r\n\r\nGET /api/health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n');
+    check(statuses(r4.got).join() === '200,200', 'well-formed pipelining still works', r4.got.slice(0, 80));
+  }
 
   section('SSE fan-out and catch-up');
   check(await until(() => live.events.length >= 4), 'four live events', live.events.length);

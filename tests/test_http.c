@@ -76,6 +76,52 @@ static void t_errors(void) {
     CHECK(http_parse_request_ex(no, strlen(no), &r, &expect, big_limit, NULL) == -413);
 }
 
+/* Framing that a proxy and this parser could read differently (request
+ * smuggling) is rejected, never ignored. */
+static void t_strict_framing(void) {
+    http_request r;
+    /* whitespace between field name and colon (RFC 9112 5.1) */
+    CHECK(parse("POST / HTTP/1.1\r\nHost: x\r\nContent-Length : 5\r\n\r\nhello", &r) == -400);
+    CHECK(parse("POST / HTTP/1.1\r\nHost: x\r\nContent-Length\t: 5\r\n\r\nhello", &r) == -400);
+    /* the smuggling case: a pipelined second request hidden in the "ignored" body */
+    const char *smug = "POST /a HTTP/1.1\r\nHost: x\r\nContent-Length : 32\r\n\r\n"
+                       "GET /admin HTTP/1.1\r\nHost: x\r\n\r\n"
+                       "GET /b HTTP/1.1\r\nHost: x\r\n\r\n";
+    CHECK(parse(smug, &r) == -400);
+    /* names must be tokens */
+    CHECK(parse("GET / HTTP/1.1\r\nHost: x\r\n X-Fold: a\r\n\r\n", &r) == -400);   /* obs-fold */
+    CHECK(parse("GET / HTTP/1.1\r\nHost: x\r\n\tX: a\r\n\r\n", &r) == -400);
+    CHECK(parse("GET / HTTP/1.1\r\nHost: x\r\nX(y): a\r\n\r\n", &r) == -400);
+    CHECK(parse("GET / HTTP/1.1\r\nHost: x\r\nX\"y: a\r\n\r\n", &r) == -400);
+    CHECK(parse("GET / HTTP/1.1\r\nHost: x\r\nX/y: a\r\n\r\n", &r) == -400);
+    const char *ok = "GET / HTTP/1.1\r\nHost: x\r\nX-A_b.c~!#$%&'*+^`|: v\r\n\r\n";
+    CHECK(parse(ok, &r) == (long)strlen(ok));
+    CHECK_STR(http_req_header(&r, "x-a_b.c~!#$%&'*+^`|"), "v");
+    http_request_free(&r);
+    /* bare CR / LF anywhere in the header block */
+    CHECK(parse("GET / HTTP/1.1\r\nHost: x\r\nX: a\rContent-Length: 5\r\n\r\nhello", &r) == -400);
+    CHECK(parse("GET / HTTP/1.1\r\nHost: x\r\nX: a\r\r\n\r\n", &r) == -400);
+    CHECK(parse("GET /\r HTTP/1.1\r\nHost: x\r\n\r\n", &r) == -400);
+    CHECK(parse("GET / HTTP/1.1\rHost: x\r\n\r\n", &r) == -400);
+    CHECK(parse("GET / HTTP/1.1\r\nHost: x\r\nX: a\nContent-Length: 5\r\n\r\nhello", &r) == -400);
+    CHECK(parse("GET / HTTP/1.1\nHost: x\r\n\r\n", &r) == -400);
+    /* control characters in the request-target and in values (HTAB is allowed in values) */
+    CHECK(parse("GET /a\x01b HTTP/1.1\r\nHost: x\r\n\r\n", &r) == -400);
+    CHECK(parse("GET /a\x7f HTTP/1.1\r\nHost: x\r\n\r\n", &r) == -400);
+    CHECK(parse("GET /a?q=\x1b HTTP/1.1\r\nHost: x\r\n\r\n", &r) == -400);
+    CHECK(parse("GET / HTTP/1.1\r\nHost: x\r\nX: a\x01b\r\n\r\n", &r) == -400);
+    CHECK(parse("GET / HTTP/1.1\r\nHost: x\r\nX: a\x7f\r\n\r\n", &r) == -400);
+    int expect;
+    static const char nul[] = "GET / HTTP/1.1\r\nHost: x\r\nX: a\0b\r\n\r\n";
+    CHECK(http_parse_request(nul, sizeof nul - 1, &r, &expect) == -400);
+    static const char nul_t[] = "GET /a\0b HTTP/1.1\r\nHost: x\r\n\r\n";
+    CHECK(http_parse_request(nul_t, sizeof nul_t - 1, &r, &expect) == -400);
+    const char *tab = "GET / HTTP/1.1\r\nHost: x\r\nX: a\tb \xc3\xa9\r\n\r\n";
+    CHECK(parse(tab, &r) == (long)strlen(tab));
+    CHECK_STR(http_req_header(&r, "x"), "a\tb \xc3\xa9");
+    http_request_free(&r);
+}
+
 static void t_static(void) {
     CHECK(static_path_safe("/a/b.js"));
     CHECK(static_path_safe("/"));
@@ -97,5 +143,6 @@ static void t_static(void) {
 void test_http_all(void) {
     RUN(t_parse);
     RUN(t_errors);
+    RUN(t_strict_framing);
     RUN(t_static);
 }
