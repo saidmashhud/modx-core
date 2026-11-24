@@ -68,6 +68,9 @@ static void t_ratelimit(void) {
     CHECK(!rl_blocked(&rl, "1.2.3.4", t + 30));
     /* a reset forgets the key */
     CHECK(rl.n == 1 && !rl_find_for_test(&rl, "1.2.3.4") && rl_find_for_test(&rl, "9.9.9.9"));
+    /* stale entries are pruned when new IPs arrive */
+    rl_fail(&rl, "10.0.0.1", t + 3 * MX_RL_WINDOW_MS);
+    CHECK(rl.n == 1);
     rl_free(&rl);
 }
 
@@ -96,14 +99,25 @@ static void t_ratelimit_bounded(void) {
         found += rl_blocked(&rl, ip, t2);
     }
     CHECK(found == 2 * 63 && rl.n == 64 && rl.evictions == 100000 - 63);
-    /* blocking still works for a key that fits */
     /* full and every key blocked: the oldest blocked one (6.6.6.6) makes room */
     for (int i = 0; i < MX_RL_MAX_FAILS; i++) rl_fail(&rl, "7.7.7.7", t2 + 100);
     CHECK(rl_blocked(&rl, "7.7.7.7", t2 + 100) && rl.n == 64 && !rl_blocked(&rl, "6.6.6.6", t2 + 100));
     /* once the window passed, a new key makes room by dropping every aged-out one (no eviction) */
     int64_t ev = rl.evictions;
     rl_fail(&rl, "8.8.8.8", t2 + 100 + MX_RL_WINDOW_MS);
-    CHECK(rl.n == 1 && rl.evictions == ev && !rl_blocked(&rl, "7.7.7.7", t2 + 100 + MX_RL_WINDOW_MS));
+    CHECK(rl.n < 64 && rl.evictions == ev && !rl_blocked(&rl, "7.7.7.7", t2 + 100 + MX_RL_WINDOW_MS));
+    /* and the sweep keeps dropping aged-out keys as new ones arrive */
+    for (int i = 0; i < 63; i++) {
+        snprintf(ip, sizeof ip, "s%d", i);
+        rl_fail(&rl, ip, t2 + 100 + MX_RL_WINDOW_MS);
+    }
+    CHECK(rl.n == 64 && rl.evictions == ev); /* the 60 stale keys were swept, nothing evicted */
+    for (int i = 0; i < 63; i++) {
+        snprintf(ip, sizeof ip, "s%d", i);
+        rl_reset(&rl, ip);
+    }
+    rl_reset(&rl, "8.8.8.8");
+    CHECK(rl.n == 0);
     /* removals keep the index consistent: reset every other key, the rest are found */
     for (int i = 0; i < 60; i++) {
         snprintf(ip, sizeof ip, "k%d", i);
@@ -113,14 +127,14 @@ static void t_ratelimit_bounded(void) {
         snprintf(ip, sizeof ip, "k%d", i);
         rl_reset(&rl, ip);
     }
-    CHECK(rl.n == 31);
+    CHECK(rl.n == 30);
     found = 0;
     for (int i = 1; i < 60; i += 2) {
         snprintf(ip, sizeof ip, "k%d", i);
         for (int k = 1; k < MX_RL_MAX_FAILS; k++) rl_fail(&rl, ip, t2 + 300 + MX_RL_WINDOW_MS);
         found += rl_blocked(&rl, ip, t2 + 300 + MX_RL_WINDOW_MS);
     }
-    CHECK(found == 30 && rl.n == 31);
+    CHECK(found == 30 && rl.n == 30);
     for (int i = 0; i < 60; i += 2) {
         snprintf(ip, sizeof ip, "k%d", i);
         found += rl_find_for_test(&rl, ip) || rl_blocked(&rl, ip, t2 + 300 + MX_RL_WINDOW_MS);

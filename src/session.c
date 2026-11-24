@@ -185,6 +185,13 @@ void rl_fail(ratelimit *rl, const char *ip, int64_t now) {
     rl_key(ip, key);
     rl_entry *e = rl_find(rl, key);
     if (!e) {
+        /* incremental sweep: a few entries per new key are checked and dropped
+         * once all their failures aged out (O(1) per call, keeps the table tidy) */
+        for (int k = 0; k < 4 && rl->n; k++) {
+            if (rl->sweep >= rl->n) rl->sweep = 0;
+            if (now - rl->entries[rl->sweep].last >= MX_RL_WINDOW_MS) rl_remove_at(rl, rl->sweep);
+            else rl->sweep++;
+        }
         if (rl->n == rl->cap) rl_make_room(rl, now);
         size_t slot = rl_slot(rl, key);
         e = &rl->entries[rl->n];

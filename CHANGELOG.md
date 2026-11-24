@@ -20,7 +20,8 @@ Hardening.
 - HTTP: socket writes use `send(..., MSG_NOSIGNAL)` where available, so a closed peer cannot raise
   SIGPIPE on Linux (`SO_NOSIGPIPE` stays on macOS / BSD).
 - Sessions: the failure rate limiter is bounded (`MX_RL_CAPACITY` = 4096 keys, or `rl_init_cap`) with a
-  hash index; when full it drops aged-out keys, then evicts the oldest unblocked one. `rl_reset` removes
+  hash index; each new key sweeps a few stored ones for aged-out keys; when full it drops every aged-out
+  key, then evicts the oldest unblocked one. `rl_reset` removes
   the key. `ratelimit` / `rl_entry` gained fields.
 - `modx/version.h`: `MODX_VERSION_MAJOR` / `MINOR` / `PATCH`, `MODX_VERSION`, `MODX_VERSION_NUM` and
   `modx_version()` (new source file `src/version.c`).

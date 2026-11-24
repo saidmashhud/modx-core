@@ -32,8 +32,9 @@ int xff_rightmost(const char *header, char *out, size_t outcap);
 /* Failure throttling: per-key (usually per-IP) timestamps of recent failures.
  * Bounded: at most `cap` keys (MX_RL_CAPACITY unless rl_init_cap says
  * otherwise; about 160 bytes each, allocated on the first failure), found
- * through a hash index. When it is full, keys whose failures have all aged
- * out are dropped first; if none has, the key with the oldest last failure
+ * through a hash index. Each new key also checks a few stored ones and
+ * drops those whose failures have all aged out. When it is full, every such
+ * key is dropped first; if none has, the key with the oldest last failure
  * is evicted, preferring keys that are not blocked. */
 #define MX_RL_CAPACITY 4096
 
@@ -52,6 +53,7 @@ typedef struct {
     size_t index_cap;   /* power of two, >= 2 * cap */
     size_t max;         /* capacity asked for (0 = MX_RL_CAPACITY) */
     int64_t evictions;  /* keys dropped while still inside the window to make room */
+    size_t sweep;       /* incremental expiry cursor */
 } ratelimit;
 
 void rl_init(ratelimit *rl);
