@@ -53,6 +53,37 @@ jobs:
       - name: mutation fuzzing (stand-alone driver, ASan + UBSan)
         run: make fuzz FUZZ_ITERS=200000
 
+  tsan:
+    runs-on: ubuntu-latest
+    env:
+      CC: clang
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
+      - name: ThreadSanitizer (worker pool, async password hashing, in-process server tests)
+        run: make test-tsan
+
+  install:
+    name: install + consumers (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: zlib headers, pkg-config, cmake
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then sudo apt-get update && sudo apt-get install -y zlib1g-dev pkg-config cmake
+          else command -v pkg-config >/dev/null || brew install pkg-config; fi
+      - name: make install into a temp prefix; build an example with pkg-config and CMake
+        run: make test-install
+      - name: CMake build of the library and its unit tests
+        run: |
+          cmake -S . -B build-cmake -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-cmake -j 4
+          ctest --test-dir build-cmake --output-on-failure
+
   libfuzzer:
     runs-on: ubuntu-latest
     steps:

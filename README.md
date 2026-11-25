@@ -88,8 +88,30 @@ int main(void) {
 }
 ```
 
-Link with `-lz -lm` (or build with `ZLIB=0` and only `-lm`). To embed: copy `include/` and `src/` into
-your tree (or add this repository as a submodule) and compile the sources with `-Iinclude`.
+## Install and use
+
+```sh
+make install PREFIX=/usr/local          # DESTDIR=… for staging; SHARED=0 for the archive only
+make uninstall PREFIX=/usr/local
+```
+
+installs `include/modx/*.h`, `lib/libmodx.a`, the shared library (`libmodx.so.0.2.0`, soname
+`libmodx.so.0.2`; `libmodx.0.2.0.dylib` on macOS), `lib/pkgconfig/modx-core.pc` and a CMake package. Then:
+
+```sh
+cc $(pkg-config --cflags modx-core) app.c $(pkg-config --libs modx-core)
+```
+
+```cmake
+find_package(modx-core 0.2 REQUIRED)       # or add_subdirectory(modx-core) / FetchContent
+target_link_libraries(app PRIVATE modx::core)
+```
+
+`CMakeLists.txt` builds and installs the same library (`cmake --install`), with an exported
+`modx::core` target; the Makefile stays the primary build. `make test-install` checks every one of these
+paths against a temporary prefix. Without installing: copy `include/` and `src/` into your tree (or add
+this repository as a submodule), compile the sources with `-Iinclude -pthread` and link `-lz -lm
+-pthread` (`ZLIB=0` / `-DMODX_NO_ZLIB` leaves zlib out).
 
 ## Guarantees
 

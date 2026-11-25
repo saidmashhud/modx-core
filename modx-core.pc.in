@@ -1,0 +1,12 @@
+prefix=@PREFIX@
+exec_prefix=${prefix}
+libdir=@LIBDIR@
+includedir=@INCLUDEDIR@
+
+Name: modx-core
+Description: C11 backend framework: event-loop HTTP/1.1 server, SSE, WebSocket, durable document store
+URL: https://github.com/saidmashhud/modx-core
+Version: @VERSION@
+Cflags: -I${includedir}
+Libs: -L${libdir} -lmodx -pthread
+Libs.private: @LIBS_PRIVATE@

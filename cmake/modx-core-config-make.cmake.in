@@ -1,0 +1,29 @@
+# modx-core package for CMake, installed by `make install` (the CMake build
+# installs its own, generated one). Defines the imported target modx::core.
+include(CMakeFindDependencyMacro)
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_dependency(Threads)
+set(_modx_deps Threads::Threads)
+if(@ZLIB@)
+  find_dependency(ZLIB)
+  list(APPEND _modx_deps ZLIB::ZLIB)
+endif()
+find_library(_modx_libm m)
+if(_modx_libm)
+  list(APPEND _modx_deps ${_modx_libm})
+endif()
+if(NOT TARGET modx::core)
+  # the shared library when it was installed (SHARED=1), else the archive
+  find_library(MODX_CORE_LIBRARY NAMES modx PATHS "@LIBDIR@" NO_DEFAULT_PATH)
+  if(NOT MODX_CORE_LIBRARY)
+    set(modx-core_FOUND FALSE)
+    set(modx-core_NOT_FOUND_MESSAGE "libmodx not found in @LIBDIR@")
+    return()
+  endif()
+  add_library(modx::core UNKNOWN IMPORTED)
+  set_target_properties(modx::core PROPERTIES
+    IMPORTED_LOCATION "${MODX_CORE_LIBRARY}"
+    INTERFACE_INCLUDE_DIRECTORIES "@INCLUDEDIR@"
+    INTERFACE_LINK_LIBRARIES "${_modx_deps}")
+endif()
+set(modx-core_FOUND TRUE)

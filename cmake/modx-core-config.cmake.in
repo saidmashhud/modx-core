@@ -1,0 +1,11 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_dependency(Threads)
+if(@MODX_ZLIB@)
+  find_dependency(ZLIB)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/modx-core-targets.cmake")
+check_required_components(modx-core)

@@ -42,6 +42,21 @@
   IPv4-mapped) and `mx_ip_rate_key()` (IPv4 as is, IPv6 per /64 by default: `2001:db8:1:2::/64`).
   `xff_rightmost()` now returns the normalized address and rejects what is not an address literal (it used
   to accept any run of hex digits, dots and colons, such as `1.2.3`).
+- **Install / packaging.** `make install` / `make uninstall` with `PREFIX`, `DESTDIR`, `LIBDIR`,
+  `INCLUDEDIR`, `SHARED` (default 1): headers to `include/modx`, `libmodx.a`, the shared library
+  (`libmodx.so.<version>` with soname `libmodx.so.<abi>`, or `libmodx.<version>.dylib` with install name
+  `libmodx.<abi>.dylib`; the ABI version is `0.<minor>` while the major is 0), `modx-core.pc`
+  (`pkg-config --libs modx-core`; `--static` adds `-lz -lm`) and a CMake package. The build tree's
+  archive is still `build/libmodxcore.a`.
+- **CMake**: `CMakeLists.txt` builds the library as `modx::core` (alias of `modx-core`, output name `modx`),
+  installs it with an exported config package (`find_package(modx-core 0.2)`, same-minor compatibility)
+  and the pkg-config file, works with `add_subdirectory` / `FetchContent` (install rules and tests only at
+  top level), and runs the unit tests through `ctest`. Options `MODX_ZLIB`, `BUILD_SHARED_LIBS`,
+  `MODX_INSTALL`, `MODX_BUILD_TESTS`.
+- `make test-install` (`tests/install_test.sh`): installs into a temporary prefix and builds
+  `examples/install/hello.c` with pkg-config (shared and static), CMake `find_package` against both the
+  make- and the cmake-installed prefix, and `add_subdirectory`; checks DESTDIR staging and that uninstall
+  leaves nothing. CI runs it on Linux and macOS, plus a CMake build with `ctest` and a ThreadSanitizer job.
 - `secure_zero()`; PBKDF2 wipes its HMAC state and no longer allocates for salts up to 256 bytes.
 - Fork safety: background compaction forks from the loop thread; its child only serializes the snapshot
   and writes it (malloc, write, fsync, rename) and never touches the pool; workers hold no libc or modx
