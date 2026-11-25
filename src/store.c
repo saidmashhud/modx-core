@@ -623,9 +623,10 @@ static json *parse_record_body(const char *line, size_t line_len, const char **w
     const char *op = json_get_str(ch, "op"), *cid = json_get_str(ch, "id");
     const json *data = json_get(ch, "data");
     int is_put = op && strcmp(op, "put") == 0, is_del = op && strcmp(op, "del") == 0;
-    if (!cid || (!is_put && !is_del) || (is_put && (!data || data->type != JSON_OBJECT))) {
+    if (!cid || (!is_put && !is_del) || (is_put && (!data || data->type != JSON_OBJECT || !json_get_str(data, "id")))) {
+        /* a put's row needs its string "id" like every stored row (mx_store_put requires it) */
         json_free(ch);
-        *why = "checksum matches but the record has no id / op / data";
+        *why = "checksum matches but the record has no id / op / data (or a row without an id)";
         return NULL;
     }
     return ch;
@@ -1141,7 +1142,8 @@ void mx_store_tick(mx_store *st) {
 
 static int cmp_row_id(const void *a, const void *b) {
     const json *x = *(const json *const *)a, *y = *(const json *const *)b;
-    return strcmp(json_get_str(x, "id"), json_get_str(y, "id"));
+    const char *ix = json_get_str(x, "id"), *iy = json_get_str(y, "id");
+    return strcmp(ix ? ix : "", iy ? iy : ""); /* rows always have one; never crash a snapshot over it */
 }
 
 static void serialize_snapshot(const mx_store *st, sbuf *out) {

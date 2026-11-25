@@ -868,6 +868,21 @@ static void t_recovery_seq(void) {
     append_put(jp, 3, "c");
     st = open_opts(dir, 0, err, sizeof err);
     CHECK(st == NULL && strstr(err, "seq 3 after 0"));
+    /* a CRC-valid put whose row has no "id" is damage, not a row (it used to be stored, and the next
+     * snapshot crashed sorting it) */
+    unlink(jp);
+    append_put(jp, 1, "a");
+    append_record(jp, "{\"seq\":2,\"entity\":\"items\",\"op\":\"put\",\"id\":\"x\",\"data\":{\"n\":1},\"ts\":1}");
+    append_put(jp, 3, "c");
+    st = open_opts(dir, 0, err, sizeof err);
+    CHECK(st == NULL && strstr(err, "without an id"));
+    st = open_opts(dir, 1, err, sizeof err);
+    CHECK(st && st->seq == 3 && mx_store_count(st, T_ITEMS) == 2 && !mx_store_get(st, T_ITEMS, "x"));
+    mx_store_close(st);
+    rm_rf(dir);
+    dir = make_tmpdir();
+    free(jp);
+    jp = file_path(dir, "journal.log");
     /* regression: 1, 2, 2 */
     unlink(jp);
     append_put(jp, 1, "a");

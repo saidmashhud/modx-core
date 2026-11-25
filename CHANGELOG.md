@@ -8,7 +8,8 @@
   (`recovered_truncated`, new `recovered_tail_bytes`). A bad record followed by valid ones, a seq gap or a
   seq going backwards after the snapshot's seq, or any damage in `journal.old` (fsynced before rotation)
   fail the open with a message naming the file, byte offset and line. A CRC-valid record without id / op /
-  data counts as damage too.
+  data, or a put whose row has no string `"id"`, counts as damage too (such a row used to be stored, and the
+  next snapshot crashed sorting it; the snapshot sort is now NULL-safe as well).
 - Store: **salvage mode**: `mx_store_open_ex()` with `mx_store_opts { salvage, report_path }`, or the
   environment variable `MODX_STORE_SALVAGE=1`. Keeps every valid record before and after damaged ones,
   accepts seq gaps, skips records whose seq goes backwards, keeps the damaged files as
