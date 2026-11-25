@@ -1,0 +1,31 @@
+# Doxygen configuration for the modx-core API reference: `make docs`
+# (output in build/docs/html/index.html). PROJECT_NUMBER is appended by make.
+PROJECT_NAME           = modx-core
+PROJECT_BRIEF          = "C11 backend framework: HTTP/1.1, SSE, WebSocket, durable document store"
+OUTPUT_DIRECTORY       = build/docs
+INPUT                  = include/modx docs
+FILE_PATTERNS          = *.h *.md
+RECURSIVE              = YES
+USE_MDFILE_AS_MAINPAGE = docs/README.md
+STRIP_FROM_PATH        = include docs
+FULL_PATH_NAMES        = YES
+OPTIMIZE_OUTPUT_FOR_C  = YES
+JAVADOC_AUTOBRIEF      = YES
+MARKDOWN_SUPPORT       = YES
+AUTOLINK_SUPPORT       = YES
+EXTRACT_ALL            = YES
+EXTRACT_STATIC         = NO
+EXTRACT_PRIVATE        = NO
+HIDE_UNDOC_RELATIONS   = YES
+SORT_MEMBER_DOCS       = NO
+TYPEDEF_HIDES_STRUCT   = NO
+ENABLE_PREPROCESSING   = YES
+MACRO_EXPANSION        = NO
+SOURCE_BROWSER         = NO
+GENERATE_HTML          = YES
+GENERATE_LATEX         = NO
+GENERATE_TREEVIEW      = YES
+QUIET                  = YES
+WARNINGS               = YES
+WARN_IF_UNDOCUMENTED   = YES
+WARN_LOGFILE           = build/docs/warnings.log

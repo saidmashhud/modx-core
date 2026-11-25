@@ -83,6 +83,10 @@ jobs:
           cmake -S . -B build-cmake -DCMAKE_BUILD_TYPE=Release
           cmake --build build-cmake -j 4
           ctest --test-dir build-cmake --output-on-failure
+      - name: make docs (Doxygen; skipped when it is missing)
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then sudo apt-get install -y doxygen; fi
+          make docs
 
   libfuzzer:
     runs-on: ubuntu-latest

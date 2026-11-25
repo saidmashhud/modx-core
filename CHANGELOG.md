@@ -58,6 +58,13 @@
   `examples/install/hello.c` with pkg-config (shared and static), CMake `find_package` against both the
   make- and the cmake-installed prefix, and `add_subdirectory`; checks DESTDIR staging and that uninstall
   leaves nothing. CI runs it on Linux and macOS, plus a CMake build with `ctest` and a ThreadSanitizer job.
+- **Documentation.** Doxygen comments on every public function, type, field and macro in
+  `include/modx/*.h`; a `Doxyfile` and `make docs` (output `build/docs/html`, skipped without doxygen);
+  hand-written `docs/`: index, getting started, guides (HTTP and routing, store and durability including the
+  read-only state after a failure and the recovery / salvage rules, sessions and passwords including async
+  hashing, SSE, WebSocket, idempotency, OT) and a per-header reference summary.
+- `examples/minimal/minimal.c` (`build/minimal`): the server the getting-started guide walks through, with a
+  deferred login on the worker pool.
 - `secure_zero()`; PBKDF2 wipes its HMAC state and no longer allocates for salts up to 256 bytes.
 - Fork safety: background compaction forks from the loop thread; its child only serializes the snapshot
   and writes it (malloc, write, fsync, rename) and never touches the pool; workers hold no libc or modx

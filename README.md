@@ -11,8 +11,15 @@ framework does the I/O, durability and fan-out.
 ```
 include/modx/   public headers           src/       implementation (libmodxcore.a)
 tests/          unit tests + example e2e  fuzz/      fuzz targets (stand-alone driver and libFuzzer)
-bench/          load generator + driver   examples/todo  a complete server on the framework
+bench/          load generator + driver   examples/  todo (complete server), minimal, install (consumer)
+docs/           guides + API reference    cmake/     package config templates
 ```
+
+**Documentation:** [docs/](docs/README.md): [getting started](docs/getting-started.md), guides
+([HTTP](docs/guides/http.md), [store and durability](docs/guides/store.md),
+[sessions and passwords](docs/guides/sessions.md), [SSE](docs/guides/sse.md),
+[WebSocket](docs/guides/websocket.md), [idempotency](docs/guides/idempotency.md), [OT](docs/guides/ot.md)) and
+the [API reference](docs/reference.md); `make docs` generates the full reference from the headers (Doxygen).
 
 ## What is in it
 
@@ -189,6 +196,8 @@ runners are noisy, so those numbers show trends, not capacity.
 make test            # unit tests (store, HTTP parser, JSON, crypto, sessions, OT, WebSocket, gzip, cache, timers)
                      # + tests/todo.mjs against the example, with kqueue/epoll and again with poll()
 make test-debug      # the same under ASan + UBSan
+make test-tsan       # unit tests under ThreadSanitizer (worker pool, async hashing, socket tests)
+make test-install    # install into a temp prefix, build an example with pkg-config and CMake
 make fuzz            # mutation fuzzing of the HTTP parser, JSON, journal recovery and WebSocket frames
 make fuzz-libfuzzer  # the same targets with libFuzzer (LLVM clang)
 ```

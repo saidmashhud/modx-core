@@ -25,7 +25,7 @@ TEST_OBJ := $(TEST_SRC:tests/%.c=$(BUILD)/tests/%.o)
 HDR      := $(wildcard include/modx/*.h)
 
 .PHONY: all lib shared test test-unit test-example debug test-debug tsan test-tsan examples bench bench-quick fuzz fuzz-libfuzzer \
-        install install-static install-shared uninstall test-install pc clean
+        install install-static install-shared uninstall test-install pc docs clean
 
 all: lib examples
 
@@ -50,10 +50,13 @@ $(BUILD)/test_unit: $(TEST_OBJ) $(LIB)
 $(BUILD)/todo: examples/todo/todo.c $(LIB) $(HDR)
 	$(CC) $(ALL_CFLAGS) $(ALL_LDFLAGS) -o $@ examples/todo/todo.c $(LIB) $(LDLIBS)
 
+$(BUILD)/minimal: examples/minimal/minimal.c $(LIB) $(HDR)
+	$(CC) $(ALL_CFLAGS) $(ALL_LDFLAGS) -o $@ examples/minimal/minimal.c $(LIB) $(LDLIBS)
+
 $(BUILD)/loadgen: bench/loadgen.c
 	$(CC) $(OPT) $(STD) $(WARN) $(ALL_LDFLAGS) -o $@ bench/loadgen.c $(LDLIBS)
 
-examples: $(BUILD)/todo
+examples: $(BUILD)/todo $(BUILD)/minimal
 
 test-unit: $(BUILD)/test_unit
 	./$(BUILD)/test_unit
@@ -197,6 +200,16 @@ uninstall:
 # pkg-config (shared and static) and CMake (find_package, add_subdirectory)
 test-install:
 	sh tests/install_test.sh
+
+# API reference from the header comments (Doxygen); skipped when doxygen is not installed.
+# Hand-written guides: docs/README.md.
+docs:
+	@if command -v doxygen >/dev/null 2>&1; then \
+	  mkdir -p build/docs && ( cat Doxyfile; echo "PROJECT_NUMBER = $(VERSION)" ) | doxygen - && \
+	  echo "API reference: build/docs/html/index.html (warnings: build/docs/warnings.log)"; \
+	else \
+	  echo "doxygen not found: skipping the generated API reference (hand-written summary: docs/reference.md)"; \
+	fi
 
 clean:
 	rm -rf build build-debug build-fuzz build-tsan
