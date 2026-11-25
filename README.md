@@ -18,14 +18,14 @@ bench/          load generator + driver   examples/todo  a complete server on th
 
 | Module | Header | |
 |---|---|---|
-| HTTP server | `http.h` | HTTP/1.1, keep-alive, pipelining, `Expect: 100-continue`, per-route body limits, streamed file responses; kqueue (macOS/BSD), epoll (Linux), poll() fallback; connection limit; header / body / write / idle timeouts (slowloris); lingering close; graceful drain on shutdown; gzip; **durability barrier** (group commit) |
+| HTTP server | `http.h` | HTTP/1.1 over IPv4 / IPv6 / dual stack, keep-alive, pipelining, `Expect: 100-continue`, per-route body limits, streamed file responses; kqueue (macOS/BSD), epoll (Linux), poll() fallback; connection limit; header / body / write / idle timeouts (slowloris); lingering close; graceful drain on shutdown; gzip; **durability barrier** (group commit) |
 | Store | `store.h` | collections registered by the app; snapshot + journal (`<crc32> <json>\n`), torn-tail recovery, fail-stop on other damage, salvage mode; **group commit**; **background compaction** (fork + copy-on-write); change ring with catch-up; hooks for storage keys, redaction, change scopes and derived state; **secondary indexes** |
 | SSE | `sse.h` | event framing, streams bound to app data, filtered broadcast, pings |
 | WebSocket | `ws.h` | RFC 6455: handshake, masking, fragmentation, ping/pong, close codes 1002/1007/1009, limits, idle pings |
 | JSON | `json.h` | parser and writer (UTF-8, `\u` escapes, surrogate pairs) |
 | Crypto | `crypto.h` | SHA-256, HMAC, PBKDF2, SHA-1 (WebSocket only), base64, hex, constant-time compare, OS randomness, password hashes (PBKDF2-SHA256, 600 000 iterations, older counts still verify; **async** on the worker pool, rehash check) |
 | Worker pool | `pool.h` | pthreads workers for CPU-bound jobs; completions run on the loop thread (the server's poller is woken through a pipe); bounded queue; fork-safe with background compaction |
-| Sessions | `session.h` | cookie parsing, Origin/Host CSRF check, JSON content type, `X-Forwarded-For`, failure throttling, session tokens (store the hash) |
+| Sessions | `session.h` | cookie parsing, Origin/Host CSRF check, JSON content type, `X-Forwarded-For`, IPv4 / IPv6 address normalization and limiter keys (IPv6 per /64), failure throttling, session tokens (store the hash) |
 | Static files | `static.h` | safe paths, MIME types, SPA fallback, immutable caching for hashed assets, weak ETag / 304 |
 | Idempotency keys | `idem.h` | `Idempotency-Key` validation, remembered answers (2xx / 4xx) replayed with `Idempotent-Replayed: true`, method + target mismatch check, pruning by age and per-owner cap; records live in a private store collection |
 | Response cache | `cache.h` | LRU of bodies valid only for the store `seq` they were built at |

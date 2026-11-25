@@ -6,6 +6,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
@@ -291,27 +292,115 @@ static int set_nonblock(int fd) {
     return fcntl(fd, F_SETFL, fl | O_NONBLOCK);
 }
 
-int http_server_listen(http_server *srv, const char *host, int port) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+int http_addr_format(const struct sockaddr *sa, char *out, size_t cap) {
+    if (!cap) return 0;
+    out[0] = 0;
+    if (!sa) return 0;
+    if (sa->sa_family == AF_INET) {
+        return inet_ntop(AF_INET, &((const struct sockaddr_in *)(const void *)sa)->sin_addr, out, (socklen_t)cap) != NULL;
+    }
+    if (sa->sa_family == AF_INET6) {
+        const struct in6_addr *a6 = &((const struct sockaddr_in6 *)(const void *)sa)->sin6_addr;
+        if (IN6_IS_ADDR_V4MAPPED(a6)) /* a dual-stack socket's IPv4 peer: show it as IPv4 */
+            return inet_ntop(AF_INET, (const unsigned char *)a6 + 12, out, (socklen_t)cap) != NULL;
+        return inet_ntop(AF_INET6, a6, out, (socklen_t)cap) != NULL;
+    }
+    return 0;
+}
+
+/* Binds one socket. v6only: -1 = leave the system default, 0 = dual stack, 1 = IPv6 only. */
+static int bind_listen(const struct sockaddr *sa, socklen_t len, int v6only) {
+    int fd = socket(sa->sa_family, SOCK_STREAM, 0);
     if (fd < 0) return -1;
     int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof addr);
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons((uint16_t)port);
-    if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) { close(fd); errno = EINVAL; return -1; }
-    if (bind(fd, (struct sockaddr *)&addr, sizeof addr) != 0 || listen(fd, 128) != 0 || set_nonblock(fd) != 0) {
+#ifdef IPV6_V6ONLY
+    if (sa->sa_family == AF_INET6 && v6only >= 0)
+        setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof v6only);
+#else
+    (void)v6only;
+#endif
+    fcntl(fd, F_SETFD, FD_CLOEXEC);
+    if (bind(fd, sa, len) != 0 || listen(fd, 128) != 0 || set_nonblock(fd) != 0) {
         int e = errno;
         close(fd);
         errno = e;
         return -1;
     }
-    socklen_t al = sizeof addr;
-    getsockname(fd, (struct sockaddr *)&addr, &al);
+    return fd;
+}
+
+int http_server_listen(http_server *srv, const char *host, int port) {
+    char h[64];
+    if (!host || !*host || strcmp(host, "*") == 0) host = "::"; /* every address, both families */
+    size_t hl = strlen(host);
+    if (hl >= sizeof h) { errno = EINVAL; return -1; }
+    if (host[0] == '[' && hl > 2 && host[hl - 1] == ']') { /* "[::1]" */
+        memcpy(h, host + 1, hl - 2);
+        h[hl - 2] = 0;
+    } else {
+        memcpy(h, host, hl + 1);
+    }
+    if (port < 0 || port > 65535) { errno = EINVAL; return -1; }
+    struct sockaddr_storage ss;
+    memset(&ss, 0, sizeof ss);
+    socklen_t len = 0;
+    int fd = -1, v6only = 1;
+    struct sockaddr_in *a4 = (struct sockaddr_in *)&ss;
+    struct sockaddr_in6 *a6 = (struct sockaddr_in6 *)&ss;
+    if (inet_pton(AF_INET, h, &a4->sin_addr) == 1) {
+        a4->sin_family = AF_INET;
+        a4->sin_port = htons((uint16_t)port);
+        len = sizeof *a4;
+    } else if (inet_pton(AF_INET6, h, &a6->sin6_addr) == 1) {
+        a6->sin6_family = AF_INET6;
+        a6->sin6_port = htons((uint16_t)port);
+        len = sizeof *a6;
+        /* "::" means every address: IPv4 too (as ::ffff:a.b.c.d) where the system allows it */
+        v6only = IN6_IS_ADDR_UNSPECIFIED(&a6->sin6_addr) ? 0 : 1;
+    } else {
+        /* a name ("localhost"): the first address it resolves to */
+        struct addrinfo hints, *res = NULL;
+        memset(&hints, 0, sizeof hints);
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_flags = AI_PASSIVE;
+        if (getaddrinfo(h, NULL, &hints, &res) != 0 || !res) { errno = EINVAL; return -1; }
+        memcpy(&ss, res->ai_addr, res->ai_addrlen);
+        len = (socklen_t)res->ai_addrlen;
+        freeaddrinfo(res);
+        if (ss.ss_family == AF_INET) a4->sin_port = htons((uint16_t)port);
+        else if (ss.ss_family == AF_INET6) a6->sin6_port = htons((uint16_t)port);
+        else { errno = EAFNOSUPPORT; return -1; }
+    }
+    fd = bind_listen((struct sockaddr *)&ss, len, ss.ss_family == AF_INET6 ? v6only : -1);
+    if (fd < 0 && ss.ss_family == AF_INET6 && v6only == 0 &&
+        (errno == EAFNOSUPPORT || errno == EADDRNOTAVAIL || errno == EPROTONOSUPPORT)) {
+        /* no IPv6 on this host: "::" falls back to 0.0.0.0 */
+        memset(&ss, 0, sizeof ss);
+        a4->sin_family = AF_INET;
+        a4->sin_port = htons((uint16_t)port);
+        a4->sin_addr.s_addr = htonl(INADDR_ANY);
+        len = sizeof *a4;
+        fd = bind_listen((struct sockaddr *)&ss, len, -1);
+    }
+    if (fd < 0) return -1;
+    struct sockaddr_storage bound;
+    socklen_t bl = sizeof bound;
+    getsockname(fd, (struct sockaddr *)&bound, &bl);
     srv->listen_fd = fd;
     srv->poll_fd = -1;
-    srv->port = ntohs(addr.sin_port);
+    srv->listen_family = bound.ss_family;
+    srv->listen_dual_stack = 0;
+#ifdef IPV6_V6ONLY
+    if (bound.ss_family == AF_INET6) {
+        int only = 1;
+        socklen_t ol = sizeof only;
+        if (getsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &only, &ol) == 0) srv->listen_dual_stack = !only;
+    }
+#endif
+    srv->port = bound.ss_family == AF_INET6 ? ntohs(((struct sockaddr_in6 *)&bound)->sin6_port)
+                                            : ntohs(((struct sockaddr_in *)&bound)->sin_port);
     return 0;
 }
 
@@ -633,10 +722,7 @@ static void accept_all(http_server *srv) {
 #endif
         http_conn *c = xcalloc(1, sizeof *c);
         c->fd = fd;
-        if (peer.ss_family == AF_INET)
-            inet_ntop(AF_INET, &((struct sockaddr_in *)&peer)->sin_addr, c->ip, sizeof c->ip);
-        else if (peer.ss_family == AF_INET6)
-            inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&peer)->sin6_addr, c->ip, sizeof c->ip);
+        http_addr_format((struct sockaddr *)&peer, c->ip, sizeof c->ip);
         sbuf_init(&c->in);
         sbuf_init(&c->out);
         c->send_fd = -1;

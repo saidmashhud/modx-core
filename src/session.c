@@ -1,5 +1,7 @@
 #include "modx/session.h"
 
+#include <arpa/inet.h>
+
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -213,6 +215,77 @@ void rl_reset(ratelimit *rl, const char *ip) {
     if (v) rl_remove_at(rl, v - 1);
 }
 
+int mx_ip_normalize(const char *in, char *out, size_t outcap) {
+    if (!in || !outcap) return 0;
+    while (*in == ' ' || *in == '\t') in++;
+    size_t n = strlen(in);
+    while (n && (in[n - 1] == ' ' || in[n - 1] == '\t')) n--;
+    if (n == 0 || n > 63) return 0;
+    char buf[64];
+    memcpy(buf, in, n);
+    buf[n] = 0;
+    char *addr = buf;
+    if (buf[0] == '[') {
+        /* "[v6]" or "[v6]:port" */
+        char *close = strchr(buf, ']');
+        if (!close) return 0;
+        if (close[1] && (close[1] != ':' || !close[2] || strspn(close + 2, "0123456789") != strlen(close + 2))) return 0;
+        *close = 0;
+        addr = buf + 1;
+    } else {
+        /* "a.b.c.d:port": exactly one colon after a dotted quad */
+        char *colon = strchr(buf, ':');
+        if (colon && !strchr(colon + 1, ':') && strchr(buf, '.') && strchr(buf, '.') < colon) {
+            if (!colon[1] || strspn(colon + 1, "0123456789") != strlen(colon + 1)) return 0;
+            *colon = 0;
+        }
+    }
+    char *zone = strchr(addr, '%'); /* fe80::1%en0: the zone says nothing about the client */
+    if (zone) *zone = 0;
+    unsigned char raw[16];
+    char tmp[INET6_ADDRSTRLEN];
+    if (inet_pton(AF_INET, addr, raw) == 1) {
+        if (!inet_ntop(AF_INET, raw, tmp, sizeof tmp)) return 0;
+    } else if (inet_pton(AF_INET6, addr, raw) == 1) {
+        static const unsigned char mapped[12] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
+        if (memcmp(raw, mapped, 12) == 0) {
+            if (!inet_ntop(AF_INET, raw + 12, tmp, sizeof tmp)) return 0;
+        } else if (!inet_ntop(AF_INET6, raw, tmp, sizeof tmp)) {
+            return 0;
+        }
+    } else {
+        return 0;
+    }
+    if (strlen(tmp) + 1 > outcap) return 0;
+    memcpy(out, tmp, strlen(tmp) + 1);
+    return 1;
+}
+
+int mx_ip_rate_key(const char *ip, unsigned v6_prefix, char *out, size_t outcap) {
+    char norm[64];
+    if (!mx_ip_normalize(ip, norm, sizeof norm)) return 0;
+    unsigned char raw[16];
+    if (inet_pton(AF_INET6, norm, raw) != 1) { /* IPv4: the address itself */
+        if (strlen(norm) + 1 > outcap) return 0;
+        memcpy(out, norm, strlen(norm) + 1);
+        return 1;
+    }
+    unsigned bits = v6_prefix ? v6_prefix : MX_IP_V6_PREFIX;
+    if (bits > 128) bits = 128;
+    for (unsigned i = 0; i < 16; i++) {
+        unsigned keep = bits > i * 8 ? (bits - i * 8 >= 8 ? 8 : bits - i * 8) : 0;
+        raw[i] &= (unsigned char)(0xff00u >> keep);
+    }
+    char tmp[INET6_ADDRSTRLEN];
+    if (!inet_ntop(AF_INET6, raw, tmp, sizeof tmp)) return 0;
+    char key[INET6_ADDRSTRLEN + 8];
+    if (bits == 128) snprintf(key, sizeof key, "%s", tmp);
+    else snprintf(key, sizeof key, "%s/%u", tmp, bits);
+    if (strlen(key) + 1 > outcap) return 0;
+    memcpy(out, key, strlen(key) + 1);
+    return 1;
+}
+
 int xff_rightmost(const char *header, char *out, size_t outcap) {
     if (!header || !outcap) return 0;
     const char *comma = strrchr(header, ',');
@@ -221,12 +294,12 @@ int xff_rightmost(const char *header, char *out, size_t outcap) {
     const char *e = s + strlen(s);
     while (e > s && (e[-1] == ' ' || e[-1] == '\t')) e--;
     size_t n = (size_t)(e - s);
-    if (n == 0 || n + 1 > outcap || n > 45) return 0;
-    for (const char *p = s; p < e; p++)
-        if (!isxdigit((unsigned char)*p) && *p != '.' && *p != ':') return 0;
-    memcpy(out, s, n);
-    out[n] = 0;
-    return 1;
+    if (n == 0 || n > 63) return 0;
+    char el[64];
+    memcpy(el, s, n);
+    el[n] = 0;
+    /* an address literal (IPv4, IPv6, "[v6]:port", "v4:port", IPv4-mapped), in canonical form */
+    return mx_ip_normalize(el, out, outcap);
 }
 
 #include "modx/crypto.h"

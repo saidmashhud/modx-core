@@ -24,10 +24,26 @@ int origin_matches_host(const char *origin, const char *host);
 int content_type_is_json(const char *ct);
 
 /* Behind a trusted reverse proxy: the rightmost X-Forwarded-For element (the
- * address the proxy appended), trimmed. Only [0-9A-Fa-f.:] characters are
- * accepted (IPv4 / IPv6 literals). Returns 1 and fills out, or 0 (caller falls
- * back to the socket peer). */
+ * address the proxy appended), normalized with mx_ip_normalize (IPv4, IPv6,
+ * "[v6]:port", "v4:port", IPv4-mapped IPv6 as IPv4). Returns 1 and fills
+ * out, or 0 when it is not an address literal (caller falls back to the
+ * socket peer, http_conn.ip). */
 int xff_rightmost(const char *header, char *out, size_t outcap);
+
+/* Canonical text of an IP address literal: "203.0.113.7", "2001:db8::7"
+ * (inet_ntop form: lower case, zeros compressed). Accepts surrounding
+ * blanks, "[v6]" / "[v6]:port", "a.b.c.d:port", a zone ("fe80::1%en0",
+ * dropped) and maps ::ffff:a.b.c.d to a.b.c.d, so one client has one
+ * spelling whether it came over IPv4, a dual-stack socket or a proxy header.
+ * Returns 1, or 0 (not an address / does not fit). */
+int mx_ip_normalize(const char *in, char *out, size_t outcap);
+
+/* Rate-limiter key for a client address: an IPv4 address itself; an IPv6
+ * address cut to its first v6_prefix bits (0 = MX_IP_V6_PREFIX, i.e. /64,
+ * what one subscriber usually gets), as "2001:db8:1:2::/64", so rotating
+ * through a /64 does not escape the limiter. Returns 1, or 0. */
+#define MX_IP_V6_PREFIX 64
+int mx_ip_rate_key(const char *ip, unsigned v6_prefix, char *out, size_t outcap);
 
 /* Failure throttling: per-key (usually per-IP) timestamps of recent failures.
  * Bounded: at most `cap` keys (MX_RL_CAPACITY unless rl_init_cap says

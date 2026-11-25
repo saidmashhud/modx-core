@@ -176,10 +176,47 @@ static void t_xff_token(void) {
     CHECK(session_token_new(tok2, hh) == 0 && strcmp(tok, tok2) != 0);
 }
 
+static void t_ip_addresses(void) {
+    char ip[64];
+    CHECK(mx_ip_normalize("203.0.113.7", ip, sizeof ip) && strcmp(ip, "203.0.113.7") == 0);
+    CHECK(mx_ip_normalize(" 203.0.113.7:4431 ", ip, sizeof ip) && strcmp(ip, "203.0.113.7") == 0);
+    CHECK(mx_ip_normalize("2001:DB8:0:0:0:0:0:7", ip, sizeof ip) && strcmp(ip, "2001:db8::7") == 0);
+    CHECK(mx_ip_normalize("[2001:db8::7]:443", ip, sizeof ip) && strcmp(ip, "2001:db8::7") == 0);
+    CHECK(mx_ip_normalize("[::1]", ip, sizeof ip) && strcmp(ip, "::1") == 0);
+    CHECK(mx_ip_normalize("::ffff:10.0.0.2", ip, sizeof ip) && strcmp(ip, "10.0.0.2") == 0);
+    CHECK(mx_ip_normalize("fe80::1%en0", ip, sizeof ip) && strcmp(ip, "fe80::1") == 0);
+    CHECK(!mx_ip_normalize("1.2.3", ip, sizeof ip));
+    CHECK(!mx_ip_normalize("1.2.3.4:", ip, sizeof ip));
+    CHECK(!mx_ip_normalize("1.2.3.4:80x", ip, sizeof ip));
+    CHECK(!mx_ip_normalize("[::1", ip, sizeof ip));
+    CHECK(!mx_ip_normalize("[::1]x", ip, sizeof ip));
+    CHECK(!mx_ip_normalize("example.com", ip, sizeof ip));
+    CHECK(!mx_ip_normalize("", ip, sizeof ip) && !mx_ip_normalize(NULL, ip, sizeof ip));
+    char tiny[4];
+    CHECK(!mx_ip_normalize("10.0.0.1", tiny, sizeof tiny));
+    /* limiter keys: IPv4 as is, IPv6 per /64 (or another prefix) */
+    CHECK(mx_ip_rate_key("198.51.100.4", 0, ip, sizeof ip) && strcmp(ip, "198.51.100.4") == 0);
+    CHECK(mx_ip_rate_key("2001:db8:1:2:aaaa::1", 0, ip, sizeof ip) && strcmp(ip, "2001:db8:1:2::/64") == 0);
+    char k2[64];
+    CHECK(mx_ip_rate_key("2001:db8:1:2:ffff:1:2:3", 0, k2, sizeof k2) && strcmp(ip, k2) == 0);
+    CHECK(mx_ip_rate_key("2001:db8:1:2:ffff:1:2:3", 56, ip, sizeof ip) && strcmp(ip, "2001:db8:1::/56") == 0);
+    CHECK(mx_ip_rate_key("2001:db8::1", 128, ip, sizeof ip) && strcmp(ip, "2001:db8::1") == 0);
+    CHECK(mx_ip_rate_key("::ffff:192.0.2.1", 0, ip, sizeof ip) && strcmp(ip, "192.0.2.1") == 0);
+    CHECK(!mx_ip_rate_key("nope", 0, ip, sizeof ip));
+    /* X-Forwarded-For, rightmost element, normalized */
+    CHECK(xff_rightmost("198.51.100.1, [2001:DB8::9]:1234", ip, sizeof ip) && strcmp(ip, "2001:db8::9") == 0);
+    CHECK(xff_rightmost("::ffff:203.0.113.5", ip, sizeof ip) && strcmp(ip, "203.0.113.5") == 0);
+    CHECK(xff_rightmost("203.0.113.5:61000", ip, sizeof ip) && strcmp(ip, "203.0.113.5") == 0);
+    CHECK(!xff_rightmost("10.0.0.1, unknown", ip, sizeof ip));
+    CHECK(!xff_rightmost("10.0.0.1, ", ip, sizeof ip));
+    CHECK(!xff_rightmost("1.2.3", ip, sizeof ip)); /* only hex digits, dots and colons was not enough */
+}
+
 void test_session_all(void) {
     RUN(t_cookie);
     RUN(t_origin_ct);
     RUN(t_ratelimit);
     RUN(t_ratelimit_bounded);
     RUN(t_xff_token);
+    RUN(t_ip_addresses);
 }

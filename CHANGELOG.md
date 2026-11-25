@@ -32,6 +32,16 @@
   the client left is dropped (`deferred_orphaned`). New `http_response.deferred`, `http_conn.pending`.
 - HTTP: `http_server_watch()` / `http_server_unwatch()`: extra descriptors on the server's poller (kqueue,
   epoll and poll), with a callback on the loop thread.
+- HTTP: **IPv6.** `http_server_listen()` takes `"127.0.0.1"` / `"0.0.0.0"` (IPv4 only), `"::1"` / `"[::1]"` /
+  any IPv6 literal (IPv6 only), `"::"`, `"*"`, `""` or NULL (dual stack: IPv4 clients arrive IPv4-mapped;
+  falls back to 0.0.0.0 on a host without IPv6) or a name (its first address). New
+  `http_server.listen_family` / `listen_dual_stack`. The listening socket is close-on-exec.
+- HTTP: `http_addr_format()`; `http_conn.ip` shows an IPv4-mapped peer (`::ffff:a.b.c.d`) as `a.b.c.d`, so a
+  client has the same rate-limiter key on an IPv4 and a dual-stack socket.
+- Sessions: `mx_ip_normalize()` (canonical IPv4 / IPv6 text; accepts `[v6]:port`, `v4:port`, zones,
+  IPv4-mapped) and `mx_ip_rate_key()` (IPv4 as is, IPv6 per /64 by default: `2001:db8:1:2::/64`).
+  `xff_rightmost()` now returns the normalized address and rejects what is not an address literal (it used
+  to accept any run of hex digits, dots and colons, such as `1.2.3`).
 - `secure_zero()`; PBKDF2 wipes its HMAC state and no longer allocates for salts up to 256 bytes.
 - Fork safety: background compaction forks from the loop thread; its child only serializes the snapshot
   and writes it (malloc, write, fsync, rename) and never touches the pool; workers hold no libc or modx

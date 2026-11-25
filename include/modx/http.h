@@ -89,7 +89,7 @@ struct http_conn {
     int send_fd;       /* file being streamed after `out` drains (-1 = none) */
     size_t send_left;
     int resume;        /* input left unprocessed while a file was streaming */
-    char ip[64];       /* peer address */
+    char ip[64];       /* peer address: "203.0.113.7" or "2001:db8::7" (IPv4-mapped shown as IPv4) */
     int64_t req_start; /* mono ms of the first byte of the request being received (0 = none) */
     int64_t out_since; /* mono ms output has been waiting / last write progress (0 = none) */
     int64_t requests;  /* requests served on this connection */
@@ -112,6 +112,8 @@ struct http_conn {
 struct http_server {
     int listen_fd;
     int port;
+    int listen_family;           /* AF_INET or AF_INET6 (after http_server_listen) */
+    int listen_dual_stack;       /* 1: an IPv6 socket that takes IPv4 clients too */
     http_conn **conns;
     size_t nconns;
     http_handler handler;
@@ -186,7 +188,21 @@ long http_parse_request_need(const char *buf, size_t len, http_request *req, int
                              http_body_limit_fn limit, void *ctx, size_t *need);
 void http_request_free(http_request *r);
 
+/* Listens on host:port (port 0 = any free port; srv->port is the one bound).
+ * host is a numeric address or a name:
+ *   "127.0.0.1", "0.0.0.0"        IPv4 only
+ *   "::1", "[::1]", "2001:db8::5" IPv6 only (IPV6_V6ONLY)
+ *   "::", "*", "" or NULL         every address: dual stack (IPv4 clients
+ *                                 arrive as ::ffff:a.b.c.d and are shown as
+ *                                 a.b.c.d in http_conn.ip); falls back to
+ *                                 0.0.0.0 on a host without IPv6
+ *   "localhost" etc.              the first address the name resolves to
+ * Returns 0, or -1 with errno. */
 int http_server_listen(http_server *srv, const char *host, int port);
+/* Formats an AF_INET / AF_INET6 socket address without the port; an
+ * IPv4-mapped IPv6 address (::ffff:a.b.c.d) as plain IPv4. 1 = ok. */
+struct sockaddr;
+int http_addr_format(const struct sockaddr *sa, char *out, size_t cap);
 /* On return (after *stop) the server has drained: no new connections,
  * event streams closed, requests already arriving answered, held responses
  * committed and flushed (bounded by drain_ms). */

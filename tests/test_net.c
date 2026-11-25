@@ -304,9 +304,101 @@ static void t_deferred_durable_barrier(void) {
     rm_rf(dir);
 }
 
+/* GET /ip over family/addr against a server listening on host: the http_conn.ip it saw, or NULL. */
+static char *ip_seen(int family, const char *addr, int port) {
+    sbuf out;
+    sbuf_init(&out);
+    char *ip = NULL;
+    if (request(family, addr, port, "GET /ip HTTP/1.1\r\nHost: t\r\n\r\n", &out) == 200) {
+        char *b = strstr(out.data, "\r\n\r\n");
+        if (b) ip = xstrdup(b + 4);
+    }
+    sbuf_free(&out);
+    return ip;
+}
+
+static int host_has_ipv6_loopback(void) {
+    int fd = socket(AF_INET6, SOCK_STREAM, 0);
+    if (fd < 0) return 0;
+    struct sockaddr_in6 a;
+    memset(&a, 0, sizeof a);
+    a.sin6_family = AF_INET6;
+    a.sin6_addr = in6addr_loopback;
+    int ok = bind(fd, (struct sockaddr *)&a, sizeof a) == 0;
+    close(fd);
+    return ok;
+}
+
+static void t_listen_ipv4(void) {
+    tserver ts;
+    CHECK(tserver_start(&ts, "127.0.0.1", NULL, 0) == 0);
+    CHECK(ts.srv.listen_family == AF_INET && ts.srv.port > 0 && !ts.srv.listen_dual_stack);
+    char *ip = ip_seen(AF_INET, "127.0.0.1", ts.srv.port);
+    CHECK(ip && strcmp(ip, "127.0.0.1") == 0);
+    free(ip);
+    CHECK(connect_to(AF_INET6, "::1", ts.srv.port) < 0); /* IPv4 only */
+    tserver_stop(&ts, AF_INET, "127.0.0.1");
+    /* bad hosts */
+    http_server bad;
+    memset(&bad, 0, sizeof bad);
+    errno = 0;
+    CHECK(http_server_listen(&bad, "300.1.2.3", 0) == -1);
+    CHECK(http_server_listen(&bad, "127.0.0.1", 70000) == -1 && errno == EINVAL);
+    CHECK(http_server_listen(&bad, "[::1", 0) == -1);
+}
+
+static void t_listen_ipv6(void) {
+    if (!host_has_ipv6_loopback()) {
+        fprintf(stderr, "  (no IPv6 loopback on this host: IPv6 listen tests skipped)\n");
+        return;
+    }
+    const char *hosts[] = { "::1", "[::1]" };
+    for (int i = 0; i < 2; i++) {
+        tserver ts;
+        CHECK(tserver_start(&ts, hosts[i], NULL, i) == 0);
+        CHECK(ts.srv.listen_family == AF_INET6 && !ts.srv.listen_dual_stack);
+        char *ip = ip_seen(AF_INET6, "::1", ts.srv.port);
+        CHECK(ip && strcmp(ip, "::1") == 0);
+        free(ip);
+        /* a deferred answer over IPv6 too */
+        sbuf out;
+        sbuf_init(&out);
+        CHECK(request(AF_INET6, "::1", ts.srv.port, LOGIN_OK, &out) == 200);
+        sbuf_free(&out);
+        CHECK(connect_to(AF_INET, "127.0.0.1", ts.srv.port) < 0); /* IPv6 only */
+        tserver_stop(&ts, AF_INET6, "::1");
+    }
+    /* "::" (and "" / "*"): dual stack; an IPv4 client shows as IPv4, not ::ffff:127.0.0.1 */
+    const char *any[] = { "::", "*" };
+    for (int i = 0; i < 2; i++) {
+        tserver ts;
+        CHECK(tserver_start(&ts, any[i], NULL, 0) == 0);
+        CHECK(ts.srv.listen_family == AF_INET6);
+        char *v6 = ip_seen(AF_INET6, "::1", ts.srv.port);
+        CHECK(v6 && strcmp(v6, "::1") == 0);
+        free(v6);
+        if (ts.srv.listen_dual_stack) {
+            char *v4 = ip_seen(AF_INET, "127.0.0.1", ts.srv.port);
+            CHECK(v4 && strcmp(v4, "127.0.0.1") == 0);
+            free(v4);
+        } else {
+            fprintf(stderr, "  (IPV6_V6ONLY is forced on this host: dual-stack check skipped)\n");
+        }
+        tserver_stop(&ts, AF_INET6, "::1");
+    }
+    /* "0.0.0.0" stays IPv4 */
+    tserver ts;
+    CHECK(tserver_start(&ts, "0.0.0.0", NULL, 0) == 0);
+    CHECK(ts.srv.listen_family == AF_INET);
+    CHECK(connect_to(AF_INET6, "::1", ts.srv.port) < 0);
+    tserver_stop(&ts, AF_INET, "127.0.0.1");
+}
+
 void test_net_all(void) {
     RUN(t_async_login_does_not_block);
     RUN(t_deferred_pipelined_order);
     RUN(t_deferred_client_gone);
     RUN(t_deferred_durable_barrier);
+    RUN(t_listen_ipv4);
+    RUN(t_listen_ipv6);
 }
