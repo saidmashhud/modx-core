@@ -578,6 +578,16 @@ static void t_indexes(void) {
     rm_rf(dir);
 }
 
+static void flip_bit(const char *path, long off, int mask) {
+    FILE *f = fopen(path, "r+b");
+    if (!f) { perror("flip"); exit(2); }
+    fseek(f, off, SEEK_SET);
+    int ch = fgetc(f);
+    fseek(f, off, SEEK_SET);
+    fputc(ch ^ mask, f);
+    fclose(f);
+}
+
 /* Copy src to dst truncated to n bytes. */
 static void copy_prefix(const char *src, const char *dst, long n) {
     FILE *in = fopen(src, "rb"), *out = fopen(dst, "wb");
@@ -618,18 +628,22 @@ static void t_crash_points(void) {
         mx_store_close(st);
     }
     CHECK(ok);
-    /* a flipped byte anywhere in a record drops that record and everything after it */
+    /* a flipped bit in a middle record is not a torn tail: open refuses (it used to drop records 3..5) */
     copy_prefix(full, jp, ends[5]);
+    flip_bit(jp, ends[2] + 20, 0x20);
     {
-        FILE *f = fopen(jp, "r+b");
-        fseek(f, ends[2] + 20, SEEK_SET);
-        int ch = fgetc(f);
-        fseek(f, ends[2] + 20, SEEK_SET);
-        fputc(ch ^ 0x20, f);
-        fclose(f);
+        char err[512];
+        long before = file_size(jp);
+        mx_store *bad = mx_store_open(dir, DEFS, T_NCOLL, 100, &HOOKS, err, sizeof err);
+        CHECK(bad == NULL && strstr(err, "corrupt record") && strstr(err, "salvage"));
+        CHECK(file_size(jp) == before); /* nothing cut */
+        mx_store_close(bad);
     }
+    /* the last record flipped: nothing valid after it, so it is the (torn) tail */
+    copy_prefix(full, jp, ends[5]);
+    flip_bit(jp, ends[4] + 20, 0x20);
     st = open_st(dir, 100);
-    CHECK(st && st->seq == 2 && st->recovered_truncated);
+    CHECK(st && st->seq == 4 && st->recovered_truncated && file_size(jp) == ends[4]);
     mx_store_close(st);
     /* snapshots: a leftover tmp file is ignored, a truncated snapshot is refused */
     copy_prefix(full, jp, ends[5]);
@@ -754,6 +768,210 @@ static void t_sticky_fsync_failure(void) {
     rm_rf(dir);
 }
 
+
+/* ---- recovery: only a torn tail is cut; other damage fails the open or is salvaged ---- */
+
+static void append_record(const char *path, const char *body) {
+    char hdr[16];
+    snprintf(hdr, sizeof hdr, "%08x ", crc32_buf(body, strlen(body)));
+    sbuf rec;
+    sbuf_init(&rec);
+    sbuf_puts(&rec, hdr);
+    sbuf_puts(&rec, body);
+    sbuf_putc(&rec, '\n');
+    append_raw(path, rec.data);
+    sbuf_free(&rec);
+}
+
+static void append_put(const char *path, int seq, const char *id) {
+    char b[256];
+    snprintf(b, sizeof b, "{\"seq\":%d,\"entity\":\"items\",\"op\":\"put\",\"id\":\"%s\",\"data\":{\"id\":\"%s\"},\"ts\":1}",
+             seq, id, id);
+    append_record(path, b);
+}
+
+static mx_store *open_opts(const char *dir, int salvage, char *err, size_t errlen) {
+    mx_store_opts o = { salvage, NULL };
+    return mx_store_open_ex(dir, DEFS, T_NCOLL, 100, &HOOKS, &o, err, errlen);
+}
+
+static int count_prefix(const char *dir, const char *prefix) {
+    DIR *d = opendir(dir);
+    int n = 0;
+    struct dirent *e;
+    while (d && (e = readdir(d)))
+        if (strncmp(e->d_name, prefix, strlen(prefix)) == 0) n++;
+    if (d) closedir(d);
+    return n;
+}
+
+static void t_recovery_middle_damage(void) {
+    char *dir = make_tmpdir();
+    char *jp = file_path(dir, "journal.log");
+    char err[512];
+    mx_store *st;
+    long full;
+    /* a damaged line in the middle (bad CRC, then not a record at all), valid records after it */
+    append_put(jp, 1, "r1");
+    append_put(jp, 2, "r2");
+    long mid = file_size(jp);
+    append_raw(jp, "deadbeef {\"seq\":3,\"entity\":\"items\",\"op\":\"put\",\"id\":\"r3\"}\n");
+    append_raw(jp, "not even a record\n");
+    append_put(jp, 4, "r4");
+    append_put(jp, 5, "r5");
+    full = file_size(jp);
+    st = open_opts(dir, 0, err, sizeof err);
+    CHECK(st == NULL && strstr(err, "corrupt record") && strstr(err, "line 3") && strstr(err, "MODX_STORE_SALVAGE"));
+    CHECK(file_size(jp) == full);                 /* untouched */
+    CHECK(count_prefix(dir, "recovery-") == 0);
+    /* the environment variable turns salvage on, too */
+    setenv("MODX_STORE_SALVAGE", "1", 1);
+    st = open_opts(dir, 0, err, sizeof err);
+    unsetenv("MODX_STORE_SALVAGE");
+    CHECK(st && st->salvage && st->seq == 5 && mx_store_count(st, T_ITEMS) == 4 && !mx_store_get(st, T_ITEMS, "r3"));
+    CHECK(st && mx_store_get(st, T_ITEMS, "r4") && mx_store_get(st, T_ITEMS, "r5"));
+    CHECK(st && st->salvaged_records == 2 && st->seq_gaps == 1 && st->recovery_report);
+    if (st && st->recovery_report) {
+        FILE *f = fopen(st->recovery_report, "r");
+        char buf[4096];
+        size_t n = f ? fread(buf, 1, sizeof buf - 1, f) : 0;
+        buf[n] = 0;
+        if (f) fclose(f);
+        char want[64];
+        snprintf(want, sizeof want, "skipped bytes %ld..", mid);
+        CHECK(strstr(buf, want) && strstr(buf, "seq gap") && strstr(buf, "skipped records / lines: 2"));
+    }
+    CHECK(count_prefix(dir, "journal.log.damaged-") == 1 && count_prefix(dir, "recovery-") == 1);
+    CHECK(file_size(jp) == 0); /* compacted into a clean snapshot */
+    CHECK(st && mx_store_put(st, T_ITEMS, item("r6", 6), NULL) == 0 && mx_store_sync(st) == 0 && st->seq == 6);
+    mx_store_close(st);
+    /* clean from now on, without salvage */
+    st = open_opts(dir, 0, err, sizeof err);
+    CHECK(st && st->seq == 6 && mx_store_count(st, T_ITEMS) == 5 && !st->recovery_report);
+    mx_store_close(st);
+    free(jp);
+    rm_rf(dir);
+}
+
+static void t_recovery_seq(void) {
+    char *dir = make_tmpdir();
+    char *jp = file_path(dir, "journal.log");
+    char err[512];
+    /* gap: 1, 2, 4 */
+    append_put(jp, 1, "a");
+    append_put(jp, 2, "b");
+    append_put(jp, 4, "d");
+    mx_store *st = open_opts(dir, 0, err, sizeof err);
+    CHECK(st == NULL && strstr(err, "seq gap") && strstr(err, "seq 4 after 2"));
+    /* a journal that starts after the snapshot's seq + 1 has a gap as well */
+    unlink(jp);
+    append_put(jp, 3, "c");
+    st = open_opts(dir, 0, err, sizeof err);
+    CHECK(st == NULL && strstr(err, "seq 3 after 0"));
+    /* regression: 1, 2, 2 */
+    unlink(jp);
+    append_put(jp, 1, "a");
+    append_put(jp, 2, "b");
+    append_put(jp, 2, "b2");
+    append_put(jp, 3, "c");
+    st = open_opts(dir, 0, err, sizeof err);
+    CHECK(st == NULL && strstr(err, "backwards"));
+    st = open_opts(dir, 1, err, sizeof err);
+    CHECK(st && st->seq == 3 && !mx_store_get(st, T_ITEMS, "b2") && mx_store_get(st, T_ITEMS, "c") &&
+          st->salvaged_records == 1);
+    mx_store_close(st);
+    st = open_opts(dir, 0, err, sizeof err);
+    CHECK(st && st->seq == 3 && mx_store_count(st, T_ITEMS) == 3);
+    mx_store_close(st);
+    /* records the snapshot already covers are skipped (a truncate that failed after a compaction) */
+    char *sp = file_path(dir, "snapshot.json");
+    unlink(sp);
+    unlink(jp);
+    append_raw(sp, "{\"seq\":2,\"collections\":{\"items\":[{\"id\":\"a\"},{\"id\":\"b\"}]}}\n");
+    append_put(jp, 1, "a");
+    append_put(jp, 2, "b");
+    append_put(jp, 3, "c");
+    st = open_opts(dir, 0, err, sizeof err);
+    CHECK(st && st->seq == 3 && mx_store_count(st, T_ITEMS) == 3);
+    mx_store_close(st);
+    free(sp);
+    free(jp);
+    rm_rf(dir);
+}
+
+/* journal.old was fsynced before the rotation: any damage in it is fatal (it used to stop there quietly
+ * and go on with journal.log, dropping the rest of journal.old) */
+static void t_recovery_journal_old(void) {
+    char *dir = make_tmpdir();
+    char *jp = file_path(dir, "journal.log"), *op = file_path(dir, "journal.old");
+    char err[512];
+    append_put(op, 1, "a");
+    append_raw(op, "00000000 torn\n");
+    append_put(op, 2, "b");
+    append_put(jp, 3, "c");
+    mx_store *st = open_opts(dir, 0, err, sizeof err);
+    CHECK(st == NULL && strstr(err, "journal.old: corrupt record"));
+    unlink(op);
+    append_put(op, 1, "a");
+    append_put(op, 2, "b");
+    append_raw(op, "00000000 {\"seq\":3");
+    st = open_opts(dir, 0, err, sizeof err);
+    CHECK(st == NULL && strstr(err, "journal.old") && strstr(err, "never torn"));
+    st = open_opts(dir, 1, err, sizeof err);
+    CHECK(st && st->seq == 3 && mx_store_count(st, T_ITEMS) == 3 && file_size(op) == -1);
+    CHECK(count_prefix(dir, "journal.old.damaged-") == 1);
+    mx_store_close(st);
+    free(jp);
+    free(op);
+    rm_rf(dir);
+}
+
+/* Snapshots carry a CRC; old ones (0.1 / 0.2, without it) still open. */
+static void t_snapshot_checksum(void) {
+    char *dir = make_tmpdir();
+    char *jp = file_path(dir, "journal.log"), *sp = file_path(dir, "snapshot.json");
+    char err[512];
+    /* the 0.2 format: plain snapshot, CRC journal */
+    append_raw(sp, "{\"seq\":2,\"collections\":{\"items\":[\n{\"id\":\"a\",\"n\":1},\n{\"id\":\"b\",\"n\":2}],\"labels\":[]}}\n");
+    append_put(jp, 3, "c");
+    mx_store *st = open_opts(dir, 0, err, sizeof err);
+    CHECK(st && st->seq == 3 && mx_store_count(st, T_ITEMS) == 3 && !st->recovered_truncated);
+    CHECK(st && mx_store_compact(st) == 0);
+    mx_store_close(st);
+    FILE *f = fopen(sp, "rb");
+    char head[32] = { 0 };
+    CHECK(f && fread(head, 1, 20, f) == 20);
+    if (f) fclose(f);
+    CHECK(strncmp(head, "{\"crc32\":\"", 10) == 0 && head[18] == '"' && head[19] == ',');
+    /* the new snapshot is still plain JSON (an older reader sees one more key) */
+    {
+        FILE *g = fopen(sp, "rb");
+        char buf[8192];
+        size_t n = fread(buf, 1, sizeof buf, g);
+        fclose(g);
+        json *j = json_parse(buf, n, NULL, 0);
+        CHECK(j && json_get_num(j, "seq", 0) == 3 && json_get_str(j, "crc32"));
+        json_free(j);
+    }
+    st = open_opts(dir, 0, err, sizeof err);
+    CHECK(st && st->seq == 3 && mx_store_count(st, T_ITEMS) == 3);
+    mx_store_close(st);
+    /* a flipped bit inside a string still parses, but fails the checksum */
+    long ss = file_size(sp);
+    flip_bit(sp, ss - 10, 0x01);
+    st = open_opts(dir, 0, err, sizeof err);
+    CHECK(st == NULL && strstr(err, "corrupt snapshot") && strstr(err, "checksum mismatch"));
+    st = open_opts(dir, 1, err, sizeof err);
+    CHECK(st && st->snapshot_crc_mismatch && st->recovery_report && count_prefix(dir, "snapshot.json.damaged-") == 1);
+    mx_store_close(st);
+    st = open_opts(dir, 0, err, sizeof err); /* rewritten by the salvage */
+    CHECK(st && st->seq == 3);
+    mx_store_close(st);
+    free(jp);
+    free(sp);
+    rm_rf(dir);
+}
+
 void test_store_all(void) {
     RUN(t_hmap);
     RUN(t_append_reload);
@@ -768,4 +986,8 @@ void test_store_all(void) {
     RUN(t_crash_points);
     RUN(t_sticky_write_failure);
     RUN(t_sticky_fsync_failure);
+    RUN(t_recovery_middle_damage);
+    RUN(t_recovery_seq);
+    RUN(t_recovery_journal_old);
+    RUN(t_snapshot_checksum);
 }

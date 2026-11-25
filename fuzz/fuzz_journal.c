@@ -2,12 +2,15 @@
  * Each journal line gets a correct CRC prefix unless it starts with '#'
  * (then it is written raw), so both valid records and corrupt ones reach
  * the replay. Opening must never crash, and a store that opened must take a
- * new record and reopen to the same state plus that record. */
+ * new record and reopen to the same state plus that record. A journal that is
+ * refused is opened again in salvage mode, which must succeed whenever the
+ * snapshot parses and leave a store that reopens cleanly without salvage. */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <dirent.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -25,10 +28,16 @@ static void put_file(const char *name, const uint8_t *p, size_t n) {
     fclose(f);
 }
 
-static void rm_file(const char *name) {
-    char path[512];
-    snprintf(path, sizeof path, "%s/%s", dir, name);
-    unlink(path);
+static void rm_all(void) {
+    DIR *d = opendir(dir);
+    struct dirent *e;
+    while (d && (e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        char path[512];
+        snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
+        unlink(path);
+    }
+    if (d) closedir(d);
 }
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
@@ -37,8 +46,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         snprintf(dir, sizeof dir, "%s/modx-fuzz-journal-%d", t && *t ? t : "/tmp", (int)getpid());
         if (mkdir(dir, 0755) != 0 && errno != EEXIST) abort();
     }
-    rm_file("snapshot.json");
-    rm_file("journal.old");
+    rm_all();
     const uint8_t *z = memchr(data, 1, size);
     const uint8_t *jr = data;
     size_t jn = size;
@@ -65,7 +73,22 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     sbuf_free(&j);
     char err[256];
     mx_store *st = mx_store_open(dir, DEFS, 2, 64, NULL, err, sizeof err);
-    if (!st) return 0; /* a corrupt snapshot is refused, never half-loaded */
+    if (!st) {
+        if (strstr(err, "corrupt snapshot") && !strstr(err, "checksum")) return 0; /* never half-loaded */
+        /* damage that is not a torn tail: salvage keeps what is valid */
+        char rp[600];
+        snprintf(rp, sizeof rp, "%s/report.txt", dir);
+        mx_store_opts o = { 1, rp };
+        st = mx_store_open_ex(dir, DEFS, 2, 64, NULL, &o, err, sizeof err);
+        if (!st) {
+            if (strstr(err, "corrupt snapshot")) return 0;
+            fprintf(stderr, "salvage failed: %s\n", err);
+            abort();
+        }
+        mx_store_close(st);
+        st = mx_store_open(dir, DEFS, 2, 64, NULL, err, sizeof err);
+        if (!st) { fprintf(stderr, "reopen after salvage failed: %s\n", err); abort(); }
+    }
     int64_t seq = st->seq;
     size_t n0 = mx_store_count(st, 0), n1 = mx_store_count(st, 1);
     int had = mx_store_get(st, 0, "fuzz-added") != NULL;

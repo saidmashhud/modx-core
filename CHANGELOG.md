@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+- Store: **recovery no longer drops data silently.** Open used to stop replaying at the first bad record
+  anywhere in the journal and cut everything after it, and did not notice seq gaps. Now only a torn tail
+  (the bytes after the last record with a valid CRC in `journal.log`) is cut off and reported
+  (`recovered_truncated`, new `recovered_tail_bytes`). A bad record followed by valid ones, a seq gap or a
+  seq going backwards after the snapshot's seq, or any damage in `journal.old` (fsynced before rotation)
+  fail the open with a message naming the file, byte offset and line. A CRC-valid record without id / op /
+  data counts as damage too.
+- Store: **salvage mode**: `mx_store_open_ex()` with `mx_store_opts { salvage, report_path }`, or the
+  environment variable `MODX_STORE_SALVAGE=1`. Keeps every valid record before and after damaged ones,
+  accepts seq gaps, skips records whose seq goes backwards, keeps the damaged files as
+  `<file>.damaged-<unix ms>`, writes a report (`<dir>/recovery-<unix ms>.txt`) and compacts the recovered
+  state into a fresh snapshot and an empty journal. New fields `salvage`, `salvaged_records`,
+  `salvaged_bytes`, `seq_gaps`, `snapshot_crc_mismatch`, `recovery_report` on `mx_store`.
+- Store: **snapshot checksum.** Snapshots start with `{"crc32":"<hex8>",` (CRC-32 of every byte after that
+  prefix); a mismatch fails the open (salvage loads it if it still parses). The file is still plain JSON, so
+  0.2 readers open it; snapshots without the key (0.1 / 0.2) are read without the check. The journal
+  format is unchanged (records always had a CRC).
+
 ## 0.2.0 — 2026-11-25
 
 Hardening.

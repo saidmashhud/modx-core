@@ -19,7 +19,7 @@ bench/          load generator + driver   examples/todo  a complete server on th
 | Module | Header | |
 |---|---|---|
 | HTTP server | `http.h` | HTTP/1.1, keep-alive, pipelining, `Expect: 100-continue`, per-route body limits, streamed file responses; kqueue (macOS/BSD), epoll (Linux), poll() fallback; connection limit; header / body / write / idle timeouts (slowloris); lingering close; graceful drain on shutdown; gzip; **durability barrier** (group commit) |
-| Store | `store.h` | collections registered by the app; snapshot + journal (`<crc32> <json>\n`), torn-tail and CRC recovery; **group commit**; **background compaction** (fork + copy-on-write); change ring with catch-up; hooks for storage keys, redaction, change scopes and derived state; **secondary indexes** |
+| Store | `store.h` | collections registered by the app; snapshot + journal (`<crc32> <json>\n`), torn-tail recovery, fail-stop on other damage, salvage mode; **group commit**; **background compaction** (fork + copy-on-write); change ring with catch-up; hooks for storage keys, redaction, change scopes and derived state; **secondary indexes** |
 | SSE | `sse.h` | event framing, streams bound to app data, filtered broadcast, pings |
 | WebSocket | `ws.h` | RFC 6455: handshake, masking, fragmentation, ping/pong, close codes 1002/1007/1009, limits, idle pings |
 | JSON | `json.h` | parser and writer (UTF-8, `\u` escapes, surrogate pairs) |
@@ -104,9 +104,14 @@ your tree (or add this repository as a submodule) and compile the sources with `
   "succeeds" proves nothing once one failed), mutations are refused (the barrier answers them with 503),
   and compaction is refused. Reads keep working. `mx_store_failed()` / `mx_store_health_get()` expose the
   state; a restart replays exactly what reached the disk.
-- **Recovery.** A record is `<crc32 hex> <json>\n`. On open the journal is replayed up to the first record
-  that is torn, fails its CRC or does not parse; the tail is cut off and logged. A snapshot that does not
-  parse is a fatal error (never silently empty). Tests cut the journal at every byte offset.
+- **Recovery.** A record is `<crc32 hex> <json>\n`; a snapshot starts with `{"crc32":"<hex>",` over the
+  rest of the file. A crash can only tear the end of the journal, so on open only the bytes after the last
+  valid record are cut off (and logged). A bad record with valid records after it, a seq gap or a seq going
+  backwards, damage in `journal.old`, or a snapshot that fails its checksum or does not parse make the open
+  fail with a precise message instead of silently dropping data. Salvage mode (`mx_store_opts.salvage` or
+  `MODX_STORE_SALVAGE=1`) keeps every valid record before and after the damage, keeps the damaged files as
+  `*.damaged-<ms>`, writes `recovery-<ms>.txt` and compacts into a clean snapshot. Older journals and
+  snapshots open unchanged. Tests cut the journal at every byte offset.
 - **Compaction without stopping the world.** Past `compact_threshold` the journal is renamed to
   `journal.old`, a fresh `journal.log` takes new records and a forked child writes `snapshot.json` from its
   copy-on-write image (tmp + fsync + rename + directory fsync). The parent is blocked only for the rename
@@ -185,8 +190,9 @@ poll) с SSE и WebSocket и надёжное хранилище докумен�
 
 - **Ответ = запись на диске.** Изменения копятся за итерацию цикла, затем один `write()` и один
   `fsync()`, рассылка и только потом ответы (групповая запись).
-- **Восстановление.** Журнал обрезается по первой битой записи (обрыв, CRC, не-JSON); битый снапшот —
-  фатальная ошибка, а не тихая потеря данных.
+- **Восстановление.** Обрезается только оборванный хвост журнала. Битая запись в середине, разрыв или
+  откат seq, битый снапшот (у него теперь CRC) — открытие падает с понятной ошибкой, а не теряет данные
+  молча; режим спасения (`MODX_STORE_SALVAGE=1`) сохраняет всё целое и пишет отчёт.
 - **Компакция без остановки мира.** Снапшот пишет дочерний процесс (`fork`, copy-on-write), журнал
   продолжает писаться; падение в любой момент ничего не теряет.
 - **Производительность.** Таблица выше: каждая оптимизация измерена отдельно, на одной машине, подряд.

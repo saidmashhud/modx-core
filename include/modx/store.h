@@ -4,16 +4,21 @@
 /* modx store: an in-memory document store made durable by a snapshot file and
  * an append-only journal.
  *
- *   <dir>/snapshot.json   {"seq":N,"collections":{"<name>":[row,...],...}}
+ *   <dir>/snapshot.json   {"crc32":"<hex8>","seq":N,"collections":{"<name>":[row,...],...}}
  *   <dir>/journal.log     one record per line: "<crc32 hex8> <change json>\n"
  *
  * Rows are JSON objects with a string "id". Every put/del gets the next seq,
  * is appended to the journal and applied in memory. mx_store_sync() makes
  * everything appended so far durable (fsync) and only then hands the changes
  * to the listener (SSE fan-out etc.). On open the snapshot is loaded and the
- * journal replayed; a torn or corrupt tail (bad CRC, no newline, bad JSON) is
- * cut off. When the journal grows past compact_threshold a new snapshot is
- * written and the journal truncated.
+ * journal replayed; only a torn tail (the bytes after the last valid record)
+ * is cut off. Damage anywhere else, or a seq gap, makes the open fail unless
+ * salvage is asked for (mx_store_opts). When the journal grows past
+ * compact_threshold a new snapshot is written and the journal truncated.
+ *
+ * Threads: a store belongs to one thread (the event loop). Background
+ * compaction forks; fork only from that thread, and never touch the store
+ * from worker threads (mx_pool jobs).
  *
  * Recent public changes are kept in a ring (catch-up for clients that were
  * offline: mx_store_for_each_since). What a change means for visibility is
@@ -172,6 +177,14 @@ struct mx_store {
     const char *fail_op;       /* "write" or "fsync" (static string), NULL while healthy */
     int64_t rejected_writes;   /* mutations refused since the failure */
     int rejected_pending;      /* a mutation was refused since the last mx_store_sync */
+    /* recovery (set by open) */
+    int salvage;               /* opened in salvage mode */
+    int64_t recovered_tail_bytes; /* bytes of torn tail cut off the journal */
+    int64_t salvaged_records;  /* salvage: damaged lines / out-of-order records skipped */
+    int64_t salvaged_bytes;    /* salvage: bytes they took */
+    int64_t seq_gaps;          /* salvage: seq gaps accepted */
+    int snapshot_crc_mismatch; /* salvage: the snapshot failed its checksum but parsed */
+    char *recovery_report;     /* salvage: path of the report written (NULL = nothing was damaged) */
 };
 
 /* mx_store_sync's answer once the store has failed (and mutations' errno = EROFS). */
@@ -188,11 +201,37 @@ typedef struct {
     int64_t journal_size;
 } mx_store_health;
 
-/* Opens (creating if needed) the data dir, loads the snapshot, replays the
- * journal, truncates a torn/corrupt tail. defs must outlive the store.
- * Returns NULL and fills err on fatal errors. */
+/* Open options (mx_store_open_ex). Zero = defaults. */
+typedef struct {
+    /* Recover from damage a crash cannot cause instead of refusing to open:
+     * keep every valid journal record before and after damaged ones, accept
+     * seq gaps, skip records whose seq goes backwards, load a snapshot that
+     * fails its checksum if it still parses. The damaged files are kept as
+     * <file>.damaged-<unix ms>, a report is written, and the recovered state is
+     * compacted into a fresh snapshot + empty journal. The environment variable
+     * MODX_STORE_SALVAGE=1 turns this on as well (for an operator restart). */
+    int salvage;
+    const char *report_path;   /* salvage report (NULL = <dir>/recovery-<unix ms>.txt) */
+} mx_store_opts;
+
+/* Opens (creating if needed) the data dir, loads the snapshot, replays
+ * journal.old (left by an interrupted background compaction) and journal.log.
+ *
+ * Recovery: a crash can only tear the end of the live journal, so the bytes
+ * after its last record with a valid CRC are cut off (logged; see
+ * recovered_truncated / recovered_tail_bytes). Anything else fails the open
+ * with a message in err, because replaying past it would silently drop data:
+ * a bad record followed by valid ones, a seq gap or a seq going backwards
+ * after the snapshot's seq, damage in journal.old, a snapshot that fails its
+ * checksum or does not parse. Salvage (mx_store_opts) recovers what is valid
+ * instead. Journals and snapshots written by 0.1 / 0.2 (snapshots without a
+ * checksum) open unchanged.
+ * defs must outlive the store. Returns NULL and fills err on fatal errors. */
 mx_store *mx_store_open(const char *dir, const mx_coll_def *defs, int ncoll, size_t ring_cap,
                         const mx_store_hooks *hooks, char *err, size_t errlen);
+/* mx_store_open with options (opts may be NULL). */
+mx_store *mx_store_open_ex(const char *dir, const mx_coll_def *defs, int ncoll, size_t ring_cap,
+                           const mx_store_hooks *hooks, const mx_store_opts *opts, char *err, size_t errlen);
 void mx_store_close(mx_store *st);
 
 int mx_store_coll(const mx_store *st, const char *name);
