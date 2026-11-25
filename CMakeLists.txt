@@ -1,7 +1,7 @@
 # modx-core with CMake. The Makefile stays the primary build (tests, sanitizers,
 # fuzzing, benchmarks); this file builds the library for CMake consumers:
 #
-#   find_package(modx-core 0.2 REQUIRED)        after `make install` or `cmake --install`
+#   find_package(modx-core 0.3 REQUIRED)        after `make install` or `cmake --install`
 #   add_subdirectory(modx-core)                 vendored / submodule
 #   FetchContent_Declare(modx-core GIT_REPOSITORY https://github.com/saidmashhud/modx-core GIT_TAG <tag>)
 #   FetchContent_MakeAvailable(modx-core)

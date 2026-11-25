@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 — 2026-11-25
 
 - Store: **recovery no longer drops data silently.** Open used to stop replaying at the first bad record
   anywhere in the journal and cut everything after it, and did not notice seq gaps. Now only a torn tail
