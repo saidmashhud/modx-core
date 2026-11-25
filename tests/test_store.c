@@ -939,10 +939,11 @@ static void t_snapshot_checksum(void) {
     CHECK(st && mx_store_compact(st) == 0);
     mx_store_close(st);
     FILE *f = fopen(sp, "rb");
-    char head[32] = { 0 };
-    CHECK(f && fread(head, 1, 20, f) == 20);
+    char head[48] = { 0 };
+    CHECK(f && fread(head, 1, 33, f) == 33);
     if (f) fclose(f);
-    CHECK(strncmp(head, "{\"crc32\":\"", 10) == 0 && head[18] == '"' && head[19] == ',');
+    CHECK(strncmp(head, "{\"crc32\":\"", 10) == 0 && head[18] == '/' && head[31] == '"' && head[32] == ',');
+    CHECK(atol(head + 19) == file_size(sp) - 33);
     /* the new snapshot is still plain JSON (an older reader sees one more key) */
     {
         FILE *g = fopen(sp, "rb");
@@ -965,7 +966,29 @@ static void t_snapshot_checksum(void) {
     CHECK(st && st->snapshot_crc_mismatch && st->recovery_report && count_prefix(dir, "snapshot.json.damaged-") == 1);
     mx_store_close(st);
     st = open_opts(dir, 0, err, sizeof err); /* rewritten by the salvage */
-    CHECK(st && st->seq == 3);
+    CHECK(st && st->seq == 3 && !st->snapshot_unchecked);
+    mx_store_close(st);
+    /* an operator re-serializes it with another tool (keeps the stale "crc32" key, changes the length):
+     * loaded without the check, not refused */
+    {
+        FILE *g = fopen(sp, "rb");
+        char buf[8192];
+        size_t n = fread(buf, 1, sizeof buf, g);
+        fclose(g);
+        json *j = json_parse(buf, n, NULL, 0);
+        json *items = json_get(json_get(j, "collections"), "items");
+        CHECK(items && items->len == 3);
+        if (items && items->len) json_set(items->items[0], "n", json_num(42));
+        sbuf w;
+        sbuf_init(&w);
+        json_write(&w, j);
+        json_free(j);
+        unlink(sp);
+        append_raw(sp, w.data);
+        sbuf_free(&w);
+    }
+    st = open_opts(dir, 0, err, sizeof err);
+    CHECK(st && st->snapshot_unchecked && st->seq == 3 && json_get_num(mx_store_get(st, T_ITEMS, "a"), "n", 0) == 42);
     mx_store_close(st);
     free(jp);
     free(sp);

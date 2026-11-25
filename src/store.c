@@ -478,15 +478,21 @@ static int keep_damaged_copy(const char *path, const sbuf *bytes, replay_state *
     return rc;
 }
 
-/* Snapshot files start with {"crc32":"<hex8>", and the CRC covers every byte
- * after that prefix (the rest of the object). Old readers see one more key;
- * snapshots without it (written before 0.3) are read without the check. */
+/* Snapshot files start with {"crc32":"<hex8>/<len12>", : the CRC-32 and the
+ * byte length of everything after that prefix (the rest of the object). A
+ * bit flip keeps the length and fails the CRC. A file rewritten by another
+ * tool (an operator's jq / JSON.stringify edit) almost always has another
+ * length: it is loaded without the check, with a warning. A truncated one
+ * does not parse. Old readers see one more key; snapshots without it
+ * (written before 0.3) are read without a check. */
 #define SNAP_CRC_PREFIX "{\"crc32\":\""
-#define SNAP_CRC_HDR 20 /* {"crc32":"XXXXXXXX", */
+#define SNAP_CRC_HDR 33 /* {"crc32":"XXXXXXXX/LLLLLLLLLLLL", */
 
-/* 1: the snapshot carries a checksum (*want set); 0: old format. */
-static int snapshot_crc(const char *data, size_t len, uint32_t *want) {
-    if (len < SNAP_CRC_HDR + 1 || memcmp(data, SNAP_CRC_PREFIX, 10) != 0 || data[18] != '"' || data[19] != ',') return 0;
+/* 1: the snapshot carries a checksum header (*want, *want_len set); 0: old format. */
+static int snapshot_crc(const char *data, size_t len, uint32_t *want, uint64_t *want_len) {
+    if (len < SNAP_CRC_HDR + 1 || memcmp(data, SNAP_CRC_PREFIX, 10) != 0 || data[18] != '/' || data[31] != '"' ||
+        data[32] != ',')
+        return 0;
     uint32_t v = 0;
     for (int i = 10; i < 18; i++) {
         char c = data[i];
@@ -494,7 +500,13 @@ static int snapshot_crc(const char *data, size_t len, uint32_t *want) {
         if (h < 0) return 0;
         v = (v << 4) | (uint32_t)h;
     }
+    uint64_t l = 0;
+    for (int i = 19; i < 31; i++) {
+        if (data[i] < '0' || data[i] > '9') return 0;
+        l = l * 10 + (uint64_t)(data[i] - '0');
+    }
     *want = v;
+    *want_len = l;
     return 1;
 }
 
@@ -509,7 +521,11 @@ static int load_snapshot(mx_store *st, replay_state *rs, char *err, size_t errle
     }
     if (s.len == 0) { sbuf_free(&s); return 0; }
     uint32_t want;
-    if (snapshot_crc(s.data, s.len, &want)) {
+    uint64_t want_len;
+    int has_crc = snapshot_crc(s.data, s.len, &want, &want_len);
+    size_t body_len = has_crc ? s.len - SNAP_CRC_HDR : 0;
+    int len_differs = has_crc && want_len != (uint64_t)body_len;
+    if (has_crc && !len_differs) {
         uint32_t got = crc32_buf(s.data + SNAP_CRC_HDR, s.len - SNAP_CRC_HDR);
         if (got != want) {
             if (!rs->salvage) {
@@ -534,9 +550,19 @@ static int load_snapshot(mx_store *st, replay_state *rs, char *err, size_t errle
     json *root = json_parse(s.data, s.len, perr, sizeof perr);
     sbuf_free(&s);
     if (!root || root->type != JSON_OBJECT) {
-        snprintf(err, errlen, "corrupt snapshot %s: %s", st->snapshot_path, root ? "not an object" : perr);
+        if (len_differs)
+            snprintf(err, errlen, "corrupt snapshot %s: %s (%zu bytes after the checksum header, which says %llu: truncated?)",
+                     st->snapshot_path, root ? "not an object" : perr, body_len, (unsigned long long)want_len);
+        else
+            snprintf(err, errlen, "corrupt snapshot %s: %s", st->snapshot_path, root ? "not an object" : perr);
         json_free(root);
         return -1;
+    }
+    if (len_differs) {
+        /* parses, but not the bytes modx wrote: an edit by another tool */
+        fprintf(stderr, "modx: %s was rewritten outside modx (%zu bytes after its checksum header, which says %llu); "
+                        "loaded without the checksum\n", st->snapshot_path, body_len, (unsigned long long)want_len);
+        st->snapshot_unchecked = 1;
     }
     st->seq = (int64_t)json_get_num(root, "seq", 0);
     json *colls = json_get(root, "collections");
@@ -754,7 +780,7 @@ static int64_t replay_file(mx_store *st, const char *path, int live, replay_stat
                 damaged = 1;
             }
         } else {
-            fprintf(stderr, "modx: journal: discarding %zu bytes of torn tail at offset %zu\n", tail, good_end);
+            fprintf(stderr, "modx: journal: discarding %zu bytes of torn/corrupt tail at offset %zu\n", tail, good_end);
             if (rs->salvage) report_line(rs, "%s: cut %zu byte(s) of torn tail at offset %zu", name, tail, good_end);
         }
     }
@@ -1120,7 +1146,7 @@ static int cmp_row_id(const void *a, const void *b) {
 
 static void serialize_snapshot(const mx_store *st, sbuf *out) {
     size_t base = out->len;
-    sbuf_puts(out, SNAP_CRC_PREFIX "00000000\",");
+    sbuf_puts(out, SNAP_CRC_PREFIX "00000000/000000000000\",");
     sbuf_printf(out, "\"seq\":%lld,\"collections\":{", (long long)st->seq);
     for (int c = 0; c < st->ncoll; c++) {
         if (c) sbuf_putc(out, ',');
@@ -1139,9 +1165,10 @@ static void serialize_snapshot(const mx_store *st, sbuf *out) {
     }
     sbuf_puts(out, "}}\n");
     /* the checksum of everything after the prefix goes into the prefix */
-    char hex[9];
-    snprintf(hex, sizeof hex, "%08x", crc32_buf(out->data + base + SNAP_CRC_HDR, out->len - base - SNAP_CRC_HDR));
-    memcpy(out->data + base + 10, hex, 8);
+    char hdr[24];
+    size_t body = out->len - base - SNAP_CRC_HDR;
+    snprintf(hdr, sizeof hdr, "%08x/%012llu", crc32_buf(out->data + base + SNAP_CRC_HDR, body), (unsigned long long)body);
+    memcpy(out->data + base + 10, hdr, 21);
 }
 
 /* Writes buf as the snapshot: tmp file, fsync, rename, fsync dir. */

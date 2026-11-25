@@ -127,8 +127,8 @@ this repository as a submodule), compile the sources with `-Iinclude -pthread` a
   "succeeds" proves nothing once one failed), mutations are refused (the barrier answers them with 503),
   and compaction is refused. Reads keep working. `mx_store_failed()` / `mx_store_health_get()` expose the
   state; a restart replays exactly what reached the disk.
-- **Recovery.** A record is `<crc32 hex> <json>\n`; a snapshot starts with `{"crc32":"<hex>",` over the
-  rest of the file. A crash can only tear the end of the journal, so on open only the bytes after the last
+- **Recovery.** A record is `<crc32 hex> <json>\n`; a snapshot starts with `{"crc32":"<hex>/<length>",`
+  over the rest of the file (an edit by another tool changes the length and is loaded with a warning). A crash can only tear the end of the journal, so on open only the bytes after the last
   valid record are cut off (and logged). A bad record with valid records after it, a seq gap or a seq going
   backwards, damage in `journal.old`, or a snapshot that fails its checksum or does not parse make the open
   fail with a precise message instead of silently dropping data. Salvage mode (`mx_store_opts.salvage` or

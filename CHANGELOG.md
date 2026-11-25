@@ -64,9 +64,12 @@
   four workers hash.
 - `make test-tsan`: the unit tests under ThreadSanitizer (pool, async hashing, the new in-process socket
   tests in `tests/test_net.c`).
-- Store: **snapshot checksum.** Snapshots start with `{"crc32":"<hex8>",` (CRC-32 of every byte after that
-  prefix); a mismatch fails the open (salvage loads it if it still parses). The file is still plain JSON, so
-  0.2 readers open it; snapshots without the key (0.1 / 0.2) are read without the check. The journal
+- Store: **snapshot checksum.** Snapshots start with `{"crc32":"<hex8>/<len12>",`: the CRC-32 and the byte
+  length of everything after that prefix. A mismatch fails the open (salvage loads it if it still parses).
+  A snapshot whose length differs from the header but that parses was rewritten by another tool (an
+  operator's `jq` / `JSON.stringify` edit): it is loaded without the check, with a warning
+  (`snapshot_unchecked`); a truncated one does not parse and fails as before. The file is still plain JSON,
+  so 0.2 readers open it; snapshots without the key (0.1 / 0.2) are read without the check. The journal
   format is unchanged (records always had a CRC).
 
 ## 0.2.0 — 2026-11-25

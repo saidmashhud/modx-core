@@ -4,7 +4,7 @@
 /* modx store: an in-memory document store made durable by a snapshot file and
  * an append-only journal.
  *
- *   <dir>/snapshot.json   {"crc32":"<hex8>","seq":N,"collections":{"<name>":[row,...],...}}
+ *   <dir>/snapshot.json   {"crc32":"<hex8>/<len12>","seq":N,"collections":{"<name>":[row,...],...}}
  *   <dir>/journal.log     one record per line: "<crc32 hex8> <change json>\n"
  *
  * Rows are JSON objects with a string "id". Every put/del gets the next seq,
@@ -184,6 +184,7 @@ struct mx_store {
     int64_t salvaged_bytes;    /* salvage: bytes they took */
     int64_t seq_gaps;          /* salvage: seq gaps accepted */
     int snapshot_crc_mismatch; /* salvage: the snapshot failed its checksum but parsed */
+    int snapshot_unchecked;    /* the snapshot was rewritten outside modx (length differs): loaded unchecked */
     char *recovery_report;     /* salvage: path of the report written (NULL = nothing was damaged) */
 };
 
@@ -223,7 +224,9 @@ typedef struct {
  * with a message in err, because replaying past it would silently drop data:
  * a bad record followed by valid ones, a seq gap or a seq going backwards
  * after the snapshot's seq, damage in journal.old, a snapshot that fails its
- * checksum or does not parse. Salvage (mx_store_opts) recovers what is valid
+ * checksum or does not parse. (A snapshot rewritten by another tool, e.g. an
+ * operator's edit, has another length than its header records: it is loaded
+ * without the check, with a warning; snapshot_unchecked.) Salvage (mx_store_opts) recovers what is valid
  * instead. Journals and snapshots written by 0.1 / 0.2 (snapshots without a
  * checksum) open unchanged.
  * defs must outlive the store. Returns NULL and fills err on fatal errors. */
