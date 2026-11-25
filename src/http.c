@@ -264,6 +264,15 @@ long http_parse_request_need(const char *buf, size_t len, http_request *req, int
 
 static void poller_add(http_server *srv, http_conn *c);
 
+struct http_deferred {
+    http_server *srv;
+    http_conn *c;            /* NULL once the connection is gone */
+    http_response resp;
+    char method[16];
+    int keep_alive;
+    char *accept_encoding;   /* for gzip */
+};
+
 /* Writes to a peer that has gone must not raise SIGPIPE (which kills a
  * process that did not ignore it): MSG_NOSIGNAL per call where it exists
  * (Linux, the BSDs, recent macOS), SO_NOSIGPIPE on the socket as well where
@@ -318,6 +327,7 @@ void http_conn_send(http_conn *c, const char *data, size_t len) {
 }
 
 static void conn_free(http_server *srv, http_conn *c) {
+    if (c->pending) { c->pending->c = NULL; srv->deferred_orphaned++; } /* finished later, sent nowhere */
     close(c->fd);
     if (c->send_fd >= 0) close(c->send_fd);
     if (c->app) { if (srv->app_free) srv->app_free(c->app); else free(c->app); }
@@ -413,9 +423,69 @@ static void serialize_response(http_server *srv, http_conn *c, const http_reques
     if (!keep) c->close_after_write = 1;
 }
 
+/* ---------------- deferred responses ---------------- */
+
+
+http_deferred *http_defer(http_conn *c, const http_request *req, http_response *resp) {
+    http_deferred *d = xcalloc(1, sizeof *d);
+    d->srv = c->srv;
+    d->c = c;
+    d->resp.status = 200;
+    d->resp.file_fd = -1;
+    d->resp.content_type = "application/json; charset=utf-8";
+    sbuf_init(&d->resp.body);
+    sbuf_init(&d->resp.headers);
+    memcpy(d->method, req->method, sizeof d->method);
+    d->keep_alive = req->keep_alive;
+    const char *ae = http_req_header(req, "accept-encoding");
+    d->accept_encoding = ae ? xstrdup(ae) : NULL;
+    resp->deferred = 1;
+    c->pending = d;
+    if (c->srv) c->srv->deferred_started++;
+    return d;
+}
+
+http_response *http_deferred_response(http_deferred *d) { return &d->resp; }
+http_conn *http_deferred_conn(const http_deferred *d) { return d->c; }
+int http_deferred_alive(const http_deferred *d) { return d->c != NULL && !d->c->dead; }
+
+void http_deferred_finish(http_deferred *d) {
+    http_conn *c = d->c;
+    http_server *srv = d->srv;
+    if (srv) srv->deferred_finished++;
+    if (c && !c->dead) {
+        http_request req;
+        memset(&req, 0, sizeof req);
+        memcpy(req.method, d->method, sizeof req.method);
+        req.keep_alive = d->keep_alive;
+        http_kv ae = { (char *)"accept-encoding", d->accept_encoding };
+        if (d->accept_encoding) { req.headers = &ae; req.nheaders = 1; }
+        d->resp.sse = 0;
+        d->resp.ws = 0;
+        /* same rule as a handler's response: what it reports waits for the barrier */
+        if (srv->durable_pending && srv->durable_pending(srv->durable_ctx) && !c->held) {
+            c->held = 1;
+            c->hold_mark = c->out.len;
+        }
+        serialize_response(srv, c, &req, &d->resp);
+        if (srv->draining) c->close_after_write = 1;
+        c->last_active = mono_ms();
+    }
+    if (c) {
+        c->pending = NULL;
+        c->resume = 1; /* requests pipelined behind it */
+    }
+    if (srv) srv->wake_now = 1; /* its barrier and the pipelined requests run without waiting for I/O */
+    if (d->resp.file_fd >= 0) close(d->resp.file_fd);
+    sbuf_free(&d->resp.body);
+    sbuf_free(&d->resp.headers);
+    free(d->accept_encoding);
+    free(d);
+}
+
 static void process_input(http_server *srv, http_conn *c) {
     while (!c->is_sse && !c->is_ws && !c->close_after_write && c->in.len) {
-        if (c->send_fd >= 0) { c->resume = 1; return; } /* keep responses in order */
+        if (c->send_fd >= 0 || c->pending) { c->resume = 1; return; } /* keep responses in order */
         /* body still arriving: the headers were parsed (and the body limit checked) once */
         if (c->need && c->in.len < c->need) return;
         http_request req;
@@ -449,11 +519,13 @@ static void process_input(http_server *srv, http_conn *c) {
         sbuf_init(&resp.body);
         sbuf_init(&resp.headers);
         srv->handler(srv, c, &req, &resp, srv->ctx);
-        if (srv->durable_pending && !resp.sse && srv->durable_pending(srv->durable_ctx) && !c->held) {
-            c->held = 1;
-            c->hold_mark = c->out.len;
+        if (!resp.deferred) {
+            if (srv->durable_pending && !resp.sse && srv->durable_pending(srv->durable_ctx) && !c->held) {
+                c->held = 1;
+                c->hold_mark = c->out.len;
+            }
+            serialize_response(srv, c, &req, &resp);
         }
-        serialize_response(srv, c, &req, &resp);
         if (resp.file_fd >= 0) close(resp.file_fd);
         sbuf_free(&resp.body);
         sbuf_free(&resp.headers);
@@ -605,7 +677,7 @@ static void timeouts(http_server *srv, int64_t now) {
                 continue;
             }
         }
-        if (!c->req_start && !pending && now - c->last_active > idle) c->dead = 1;
+        if (!c->req_start && !pending && !c->pending && now - c->last_active > idle) c->dead = 1;
     }
 }
 
@@ -706,6 +778,8 @@ const char *http_server_poller(const http_server *srv) {
     return HAVE_KQUEUE ? "kqueue" : HAVE_EPOLL ? "epoll" : "poll";
 }
 
+static int poller_watch(http_server *srv, int fd, int add);
+
 static int poller_open(http_server *srv) {
     srv->poll_fd = -1;
     if (srv->use_poll) return 0;
@@ -724,6 +798,12 @@ static int poller_open(http_server *srv) {
     ev.data.ptr = NULL;
     if (epoll_ctl(srv->poll_fd, EPOLL_CTL_ADD, srv->listen_fd, &ev) != 0) { close(srv->poll_fd); srv->poll_fd = -1; }
 #endif
+    for (size_t i = 0; i < srv->nwatches && srv->poll_fd >= 0; i++)
+        if (poller_watch(srv, srv->watches[i].fd, 1) != 0) {
+            /* keep every descriptor on one poller: fall back to poll() */
+            close(srv->poll_fd);
+            srv->poll_fd = -1;
+        }
     return 0;
 }
 
@@ -761,6 +841,59 @@ static void poller_want_write(http_server *srv, http_conn *c, int want) {
 #endif
 }
 
+/* Watched descriptors are told apart from connections (aligned pointers) by an odd tag. */
+#define WATCH_TAG(fd) ((void *)(((uintptr_t)(unsigned)(fd) << 1) | 1u))
+#define IS_WATCH_TAG(p) (((uintptr_t)(p)) & 1u)
+#define WATCH_FD(p) ((int)(((uintptr_t)(p)) >> 1))
+
+static int poller_watch(http_server *srv, int fd, int add) {
+    if (srv->poll_fd < 0) return 0;
+#if HAVE_KQUEUE
+    struct kevent ev;
+    EV_SET(&ev, fd, EVFILT_READ, add ? EV_ADD : EV_DELETE, 0, 0, WATCH_TAG(fd));
+    return kevent(srv->poll_fd, &ev, 1, NULL, 0, NULL) == 0 ? 0 : -1;
+#elif HAVE_EPOLL
+    struct epoll_event ev;
+    memset(&ev, 0, sizeof ev);
+    ev.events = EPOLLIN;
+    ev.data.ptr = WATCH_TAG(fd);
+    return epoll_ctl(srv->poll_fd, add ? EPOLL_CTL_ADD : EPOLL_CTL_DEL, fd, &ev) == 0 ? 0 : -1;
+#else
+    (void)fd;
+    (void)add;
+    return 0;
+#endif
+}
+
+static void run_watch(http_server *srv, int fd) {
+    for (size_t i = 0; i < srv->nwatches; i++)
+        if (srv->watches[i].fd == fd) { srv->watches[i].cb(srv, fd, srv->watches[i].ctx); return; }
+}
+
+int http_server_watch(http_server *srv, int fd, http_fd_cb cb, void *ctx) {
+    if (fd < 0 || !cb) { errno = EINVAL; return -1; }
+    for (size_t i = 0; i < srv->nwatches; i++)
+        if (srv->watches[i].fd == fd) { errno = EEXIST; return -1; }
+    if (srv->running && poller_watch(srv, fd, 1) != 0) return -1;
+    srv->watches = xrealloc(srv->watches, (srv->nwatches + 1) * sizeof *srv->watches);
+    srv->watches[srv->nwatches].fd = fd;
+    srv->watches[srv->nwatches].cb = cb;
+    srv->watches[srv->nwatches].ctx = ctx;
+    srv->nwatches++;
+    return 0;
+}
+
+int http_server_unwatch(http_server *srv, int fd) {
+    for (size_t i = 0; i < srv->nwatches; i++) {
+        if (srv->watches[i].fd != fd) continue;
+        if (srv->running) poller_watch(srv, fd, 0);
+        srv->watches[i] = srv->watches[--srv->nwatches];
+        return 0;
+    }
+    errno = ENOENT;
+    return -1;
+}
+
 #define POLLER_BATCH 256
 
 /* Wait for events (up to timeout_ms) and handle them. */
@@ -776,6 +909,7 @@ static void wait_events(http_server *srv, int timeout_ms, volatile sig_atomic_t 
         for (int i = 0; i < n; i++) {
             http_conn *c = evs[i].udata;
             if (!c) { accept_ready = 1; continue; }
+            if (IS_WATCH_TAG(c)) { run_watch(srv, WATCH_FD(c)); continue; }
             if (c->dead) continue;
             if (evs[i].filter == EVFILT_READ) conn_read(srv, c);
             else if (evs[i].filter == EVFILT_WRITE) conn_flush(c);
@@ -793,6 +927,7 @@ static void wait_events(http_server *srv, int timeout_ms, volatile sig_atomic_t 
         for (int i = 0; i < n; i++) {
             http_conn *c = evs[i].data.ptr;
             if (!c) { accept_ready = 1; continue; }
+            if (IS_WATCH_TAG(c)) { run_watch(srv, WATCH_FD(c)); continue; }
             if (c->dead) continue;
             if (evs[i].events & (EPOLLIN | EPOLLHUP | EPOLLERR | EPOLLRDHUP)) conn_read(srv, c);
             if (!c->dead && (evs[i].events & EPOLLOUT)) conn_flush(c);
@@ -802,7 +937,7 @@ static void wait_events(http_server *srv, int timeout_ms, volatile sig_atomic_t 
     }
 #endif
     /* poll(): one pollfd per connection, rebuilt every iteration */
-    size_t n = srv->nconns + 1;
+    size_t n = srv->nconns + 1 + srv->nwatches;
     if (n > srv->pcap) { srv->pcap = n * 2; srv->pfds = xrealloc(srv->pfds, srv->pcap * sizeof *srv->pfds); }
     struct pollfd *pfds = srv->pfds;
     pfds[0].fd = srv->listen_fd;
@@ -813,6 +948,12 @@ static void wait_events(http_server *srv, int timeout_ms, volatile sig_atomic_t 
         pfds[i + 1].fd = c->fd;
         pfds[i + 1].events = POLLIN | (conn_pending(c) && !c->held ? POLLOUT : 0);
         pfds[i + 1].revents = 0;
+    }
+    size_t wbase = srv->nconns + 1, nw = srv->nwatches;
+    for (size_t i = 0; i < nw; i++) {
+        pfds[wbase + i].fd = srv->watches[i].fd;
+        pfds[wbase + i].events = POLLIN;
+        pfds[wbase + i].revents = 0;
     }
     int rc = poll(pfds, (nfds_t)n, timeout_ms);
     if (rc < 0 && errno != EINTR) { perror("poll"); *stop = 1; return; }
@@ -825,6 +966,9 @@ static void wait_events(http_server *srv, int timeout_ms, volatile sig_atomic_t 
         if (re & (POLLIN | POLLHUP | POLLERR)) conn_read(srv, c);
         if (!c->dead && (re & POLLOUT)) conn_flush(c);
     }
+    /* watches by fd: a callback may add or remove watches */
+    for (size_t i = 0; i < nw; i++)
+        if (pfds[wbase + i].revents & (POLLIN | POLLHUP | POLLERR)) run_watch(srv, pfds[wbase + i].fd);
     if (pfds[0].revents & POLLIN) accept_all(srv);
 }
 
@@ -845,7 +989,7 @@ static void drain(http_server *srv) {
             if (c->dead) continue;
             if (c->is_sse) { c->dead = 1; continue; } /* clients reconnect elsewhere / later */
             if (c->is_ws && !c->ws_closing) mx_ws_close(c, 1001, "server shutting down");
-            if (c->req_start || conn_pending(c) || c->held) busy++;
+            if (c->req_start || conn_pending(c) || c->held || c->pending) busy++;
             else c->dead = 1;                         /* idle keep-alive: just close */
         }
         if (!busy || mono_ms() > deadline) break;
@@ -866,6 +1010,8 @@ void http_server_run(http_server *srv, volatile sig_atomic_t *stop) {
 
 static void loop_once(http_server *srv, int timeout_ms, volatile sig_atomic_t *stop) {
     {
+        if (srv->wake_now) timeout_ms = 0;
+        srv->wake_now = 0;
         wait_events(srv, timeout_ms, stop);
         if (*stop) return;
         if (srv->tick) srv->tick(srv, srv->ctx);
@@ -875,9 +1021,10 @@ static void loop_once(http_server *srv, int timeout_ms, volatile sig_atomic_t *s
             http_conn *c = srv->conns[i];
             if (!c->dead && conn_pending(c)) conn_flush(c);
             /* a streamed file finished: handle requests pipelined behind it */
-            if (!c->dead && c->resume && c->send_fd < 0) {
+            if (!c->dead && c->resume && c->send_fd < 0 && !c->pending) {
                 c->resume = 0;
                 process_input(srv, c);
+                if (c->held || c->pending) srv->wake_now = 1; /* its barrier runs next iteration, now */
                 if (!c->dead && conn_pending(c)) conn_flush(c);
             }
             int pending = !c->dead && conn_pending(c) && !c->held;
@@ -910,4 +1057,7 @@ void http_server_close(http_server *srv) {
     free(srv->pfds);
     srv->pfds = NULL;
     srv->pcap = 0;
+    free(srv->watches);
+    srv->watches = NULL;
+    srv->nwatches = 0;
 }

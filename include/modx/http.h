@@ -53,10 +53,20 @@ typedef struct {
     int file_fd;       /* >= 0: the body is file_len bytes streamed from this fd (taken over
                           and closed by the server); body must be empty. -1 = none */
     size_t file_len;
+    int deferred;      /* set by http_defer: this response is ignored; the real one comes later */
 } http_response;
 
 typedef struct http_conn http_conn;
 typedef struct http_server http_server;
+typedef struct http_deferred http_deferred;
+
+/* A file descriptor watched by the server's poller (http_server_watch). */
+typedef void (*http_fd_cb)(http_server *srv, int fd, void *ctx);
+typedef struct {
+    int fd;
+    http_fd_cb cb;
+    void *ctx;
+} http_watch;
 
 typedef void (*http_handler)(http_server *srv, http_conn *c, const http_request *req,
                              http_response *resp, void *ctx);
@@ -92,6 +102,7 @@ struct http_conn {
     int want_write;    /* registered for writability with kqueue / epoll */
     http_server *srv;  /* the server that accepted it */
     sbuf deferred;     /* group commit: pushes queued while changes were pending, sent after them */
+    http_deferred *pending; /* a response the application finishes later (http_defer); input waits */
     int held;          /* group commit: output waits for the durability barrier */
     size_t hold_mark;  /* out.len before the first held response */
     void *app;         /* application data bound to the connection (e.g. an SSE subscription);
@@ -147,6 +158,10 @@ struct http_server {
     int64_t commits;             /* barrier commits run */
     int64_t commit_failures;
     void *ctx;
+    http_watch *watches;         /* extra descriptors (http_server_watch), e.g. a worker pool's wake-up */
+    size_t nwatches;
+    int64_t deferred_started, deferred_finished, deferred_orphaned;
+    int wake_now;                /* the next wait does not block (work queued outside the event path) */
 };
 
 const char *http_req_header(const http_request *r, const char *lname);
@@ -188,5 +203,36 @@ void http_server_close(http_server *srv);
  * notifications it triggers (dropped if the commit fails), so nothing is
  * announced before what it refers to is durable. */
 void http_conn_send(http_conn *c, const char *data, size_t len);
+
+/* Calls cb on the loop thread whenever fd is readable (level-triggered; cb
+ * must consume what made it readable). Works before or while the server runs,
+ * with every poller. One callback per fd. Returns 0, or -1 (fd < 0 or already
+ * watched). */
+int http_server_watch(http_server *srv, int fd, http_fd_cb cb, void *ctx);
+/* Stops watching fd (the descriptor stays open). Returns 0, or -1 if unknown. */
+int http_server_unwatch(http_server *srv, int fd);
+
+/* Deferred responses: the handler starts work that finishes later on the loop
+ * thread (a worker pool job such as password_verify_async), so the loop keeps
+ * serving other connections meanwhile. Called inside the handler, http_defer
+ * makes the server ignore resp and wait for http_deferred_finish(); further
+ * (pipelined) requests on that connection wait too, so answers stay in order.
+ * Timeouts for idle connections do not apply while it waits; a graceful drain
+ * waits for it (bounded by drain_ms).
+ *
+ * Finish on the loop thread: fill http_deferred_response() like a handler
+ * fills resp (status, body, headers, content type; not SSE / WebSocket),
+ * then call http_deferred_finish(), which sends it, or with a durability
+ * barrier holds it until the changes made so far are durable, exactly like
+ * a handler's response, then frees the handle. If the client went away in
+ * between, the response object is still valid (writes are harmless) and
+ * finish just frees it; http_deferred_alive() tells. Exactly one finish per
+ * http_defer. */
+http_deferred *http_defer(http_conn *c, const http_request *req, http_response *resp);
+http_response *http_deferred_response(http_deferred *d);
+/* The connection, or NULL once it has been closed. */
+http_conn *http_deferred_conn(const http_deferred *d);
+int http_deferred_alive(const http_deferred *d);
+void http_deferred_finish(http_deferred *d);
 
 #endif

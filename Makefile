@@ -10,20 +10,21 @@ LDLIBS   += -lz
 else
 CFLAGS   += -DMODX_NO_ZLIB
 endif
-ALL_CFLAGS  := $(OPT) $(SAN) $(STD) $(WARN) -Iinclude $(CFLAGS)
-ALL_LDFLAGS := $(SAN) $(LDFLAGS)
+ALL_CFLAGS  := $(OPT) $(SAN) $(STD) $(WARN) -pthread -Iinclude $(CFLAGS)
+ALL_LDFLAGS := $(SAN) -pthread $(LDFLAGS)
 LDLIBS   += -lm
 
 BUILD    ?= build
 SRC      := src/util.c src/json.c src/crypto.c src/http.c src/sse.c src/static.c src/ot.c \
-            src/session.c src/store.c src/timer.c src/cache.c src/gzip.c src/ws.c src/idem.c src/version.c
+            src/session.c src/store.c src/timer.c src/cache.c src/gzip.c src/ws.c src/idem.c src/version.c \
+            src/pool.c
 OBJ      := $(SRC:src/%.c=$(BUILD)/%.o)
 LIB      := $(BUILD)/libmodxcore.a
 TEST_SRC := $(wildcard tests/test_*.c)
 TEST_OBJ := $(TEST_SRC:tests/%.c=$(BUILD)/tests/%.o)
 HDR      := $(wildcard include/modx/*.h)
 
-.PHONY: all lib test test-unit test-example debug test-debug examples bench bench-quick fuzz fuzz-libfuzzer clean
+.PHONY: all lib test test-unit test-example debug test-debug tsan test-tsan examples bench bench-quick fuzz fuzz-libfuzzer clean
 
 all: lib examples
 
@@ -71,6 +72,13 @@ test-debug: debug
 	ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 ./build-debug/test_unit
 	ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 node tests/todo.mjs ./build-debug/todo
 
+# ThreadSanitizer (the worker pool, async password hashing, the in-process server tests): separate object dir.
+tsan:
+	$(MAKE) BUILD=build-tsan OPT="-O1 -g -fno-omit-frame-pointer" SAN="-fsanitize=thread" build-tsan/test_unit
+
+test-tsan: tsan
+	TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1 ./build-tsan/test_unit
+
 bench: $(BUILD)/todo $(BUILD)/loadgen
 	node bench/run.mjs --profile full
 
@@ -86,7 +94,7 @@ FUZZ_CC      ?= $(CC)
 fuzz:
 	mkdir -p build-fuzz
 	for t in $(FUZZ_TARGETS); do \
-	  $(FUZZ_CC) -O1 -g $(STD) -Iinclude $(CFLAGS) $(SAN_FLAGS) -o build-fuzz/fuzz_$$t fuzz/fuzz_$$t.c fuzz/seeds_$$t.c fuzz/driver.c $(SRC) $(LDLIBS) || exit 1; \
+	  $(FUZZ_CC) -O1 -g $(STD) -pthread -Iinclude $(CFLAGS) $(SAN_FLAGS) -o build-fuzz/fuzz_$$t fuzz/fuzz_$$t.c fuzz/seeds_$$t.c fuzz/driver.c $(SRC) $(LDLIBS) || exit 1; \
 	done
 	for t in $(FUZZ_TARGETS); do \
 	  n=$(FUZZ_ITERS); [ $$t = journal ] && n=$$(( $(FUZZ_ITERS) / 50 )); \
@@ -97,9 +105,9 @@ FUZZ_SECONDS ?= 60
 fuzz-libfuzzer:
 	mkdir -p build-fuzz
 	for t in $(FUZZ_TARGETS); do \
-	  clang -O1 -g $(STD) -Iinclude $(CFLAGS) -fsanitize=fuzzer,address,undefined -o build-fuzz/lf_$$t fuzz/fuzz_$$t.c $(SRC) $(LDLIBS) || exit 1; \
+	  clang -O1 -g $(STD) -pthread -Iinclude $(CFLAGS) -fsanitize=fuzzer,address,undefined -o build-fuzz/lf_$$t fuzz/fuzz_$$t.c $(SRC) $(LDLIBS) || exit 1; \
 	  ./build-fuzz/lf_$$t -max_total_time=$(FUZZ_SECONDS) -max_len=65536 || exit 1; \
 	done
 
 clean:
-	rm -rf build build-debug build-fuzz
+	rm -rf build build-debug build-fuzz build-tsan

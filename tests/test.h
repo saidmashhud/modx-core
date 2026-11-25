@@ -33,5 +33,6 @@ void test_ws_all(void);
 void test_gzip_all(void);
 void test_idem_all(void);
 void test_version_all(void);
+void test_pool_all(void);
 
 #endif
