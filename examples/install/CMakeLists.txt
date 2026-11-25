@@ -8,7 +8,7 @@ project(modx-hello C)
 if(MODX_CORE_SOURCE_DIR)
   add_subdirectory(${MODX_CORE_SOURCE_DIR} modx-core)
 else()
-  find_package(modx-core 0.2 REQUIRED)
+  find_package(modx-core 0.3 REQUIRED)
 endif()
 
 add_executable(hello hello.c)

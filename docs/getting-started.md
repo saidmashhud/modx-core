@@ -37,7 +37,7 @@ This installs:
 |---|---|
 | `include/modx/*.h` | the headers; include them as `#include "modx/http.h"` |
 | `lib/libmodx.a` | static library |
-| `lib/libmodx.so.0.2.0`, `libmodx.so.0.2`, `libmodx.so` | shared library (soname `libmodx.so.0.2`); on macOS `libmodx.0.2.0.dylib` (install name `libmodx.0.2.dylib`). `SHARED=0` skips it |
+| `lib/libmodx.so.0.3.0`, `libmodx.so.0.3`, `libmodx.so` | shared library (soname `libmodx.so.0.3`); on macOS `libmodx.0.3.0.dylib` (install name `libmodx.0.3.dylib`). `SHARED=0` skips it |
 | `lib/pkgconfig/modx-core.pc` | pkg-config |
 | `lib/cmake/modx-core/` | CMake package: `find_package(modx-core)` gives `modx::core` |
 
@@ -56,7 +56,7 @@ cc -std=c11 $(pkg-config --cflags modx-core) -o app app.c /usr/local/lib/libmodx
 CMake, against an installed copy:
 
 ```cmake
-find_package(modx-core 0.2 REQUIRED)
+find_package(modx-core 0.3 REQUIRED)
 target_link_libraries(app PRIVATE modx::core)
 ```
 

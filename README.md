@@ -39,7 +39,7 @@ the [API reference](docs/reference.md); `make docs` generates the full reference
 | OT | `ot.h` | plain-text operational transformation (UTF-16 offsets, compatible with ot.js) |
 | Timers | `timer.h` | periodic jobs for the loop tick |
 | gzip | `gzip.h` | zlib deflate / inflate, `Accept-Encoding` parsing |
-| Version | `version.h` | `MODX_VERSION` (`"0.2.0"`), major / minor / patch macros, `modx_version()` |
+| Version | `version.h` | `MODX_VERSION` (`"0.3.0"`), major / minor / patch macros, `modx_version()` |
 
 ## Quick start
 
@@ -102,15 +102,15 @@ make install PREFIX=/usr/local          # DESTDIR=… for staging; SHARED=0 for 
 make uninstall PREFIX=/usr/local
 ```
 
-installs `include/modx/*.h`, `lib/libmodx.a`, the shared library (`libmodx.so.0.2.0`, soname
-`libmodx.so.0.2`; `libmodx.0.2.0.dylib` on macOS), `lib/pkgconfig/modx-core.pc` and a CMake package. Then:
+installs `include/modx/*.h`, `lib/libmodx.a`, the shared library (`libmodx.so.0.3.0`, soname
+`libmodx.so.0.3`; `libmodx.0.3.0.dylib` on macOS), `lib/pkgconfig/modx-core.pc` and a CMake package. Then:
 
 ```sh
 cc $(pkg-config --cflags modx-core) app.c $(pkg-config --libs modx-core)
 ```
 
 ```cmake
-find_package(modx-core 0.2 REQUIRED)       # or add_subdirectory(modx-core) / FetchContent
+find_package(modx-core 0.3 REQUIRED)       # or add_subdirectory(modx-core) / FetchContent
 target_link_libraries(app PRIVATE modx::core)
 ```
 

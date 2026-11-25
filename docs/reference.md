@@ -610,7 +610,7 @@ Version macros (semantic versioning, matching CHANGELOG.md).
 | Name | Description |
 | --- | --- |
 | `MODX_VERSION_MAJOR`, `MODX_VERSION_MINOR`, `MODX_VERSION_PATCH` | Components. |
-| `MODX_VERSION` | Version string of the headers, e.g. `"0.2.0"`. |
+| `MODX_VERSION` | Version string of the headers, e.g. `"0.3.0"`. |
 | `MODX_VERSION_NUM` | `MAJOR * 10000 + MINOR * 100 + PATCH`, for `#if`. |
 | `modx_version` | Version the library was built as; compare with `MODX_VERSION` to catch mismatched headers and objects. |
 
