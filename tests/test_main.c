@@ -15,6 +15,7 @@ int main(void) {
     test_idem_all();
     test_version_all();
     test_pool_all();
+    test_net_all();
     fprintf(stderr, "\nunit: %d checks, %d failed\n", t_checks, t_failures);
     return t_failures ? 1 : 0;
 }

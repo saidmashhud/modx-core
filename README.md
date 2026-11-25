@@ -23,7 +23,8 @@ bench/          load generator + driver   examples/todo  a complete server on th
 | SSE | `sse.h` | event framing, streams bound to app data, filtered broadcast, pings |
 | WebSocket | `ws.h` | RFC 6455: handshake, masking, fragmentation, ping/pong, close codes 1002/1007/1009, limits, idle pings |
 | JSON | `json.h` | parser and writer (UTF-8, `\u` escapes, surrogate pairs) |
-| Crypto | `crypto.h` | SHA-256, HMAC, PBKDF2, SHA-1 (WebSocket only), base64, hex, constant-time compare, OS randomness, password hashes |
+| Crypto | `crypto.h` | SHA-256, HMAC, PBKDF2, SHA-1 (WebSocket only), base64, hex, constant-time compare, OS randomness, password hashes (PBKDF2-SHA256, 600 000 iterations, older counts still verify; **async** on the worker pool, rehash check) |
+| Worker pool | `pool.h` | pthreads workers for CPU-bound jobs; completions run on the loop thread (the server's poller is woken through a pipe); bounded queue; fork-safe with background compaction |
 | Sessions | `session.h` | cookie parsing, Origin/Host CSRF check, JSON content type, `X-Forwarded-For`, failure throttling, session tokens (store the hash) |
 | Static files | `static.h` | safe paths, MIME types, SPA fallback, immutable caching for hashed assets, weak ETag / 304 |
 | Idempotency keys | `idem.h` | `Idempotency-Key` validation, remembered answers (2xx / 4xx) replayed with `Idempotent-Replayed: true`, method + target mismatch check, pruning by age and per-owner cap; records live in a private store collection |
@@ -172,7 +173,8 @@ make fuzz-libfuzzer  # the same targets with libFuzzer (LLVM clang)
 
 ## Limits
 
-HTTP/1.1 only, no TLS (put it behind a reverse proxy), one thread per process, request bodies need a
+HTTP/1.1 only, no TLS (put it behind a reverse proxy), one event-loop thread per process (plus the small
+worker pool for password hashing), request bodies need a
 `Content-Length` (chunked uploads get 411), WebSocket without extensions, the store keeps every row in
 memory. Defaults are in `http.h` / `ws.h` and can be changed per server.
 

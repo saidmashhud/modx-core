@@ -34,5 +34,6 @@ void test_gzip_all(void);
 void test_idem_all(void);
 void test_version_all(void);
 void test_pool_all(void);
+void test_net_all(void);
 
 #endif

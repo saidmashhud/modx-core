@@ -15,6 +15,30 @@
   `<file>.damaged-<unix ms>`, writes a report (`<dir>/recovery-<unix ms>.txt`) and compacts the recovered
   state into a fresh snapshot and an empty journal. New fields `salvage`, `salvaged_records`,
   `salvaged_bytes`, `seq_gaps`, `snapshot_crc_mismatch`, `recovery_report` on `mx_store`.
+- **Password hashing no longer blocks the event loop.** New `modx/pool.h`: a small pthreads worker pool
+  (`mx_pool_new`, `mx_pool_submit`, `mx_pool_attach`, `mx_pool_run_done`, `mx_pool_wait`, `mx_pool_free`)
+  whose completions run on the loop thread; the server's poller is woken through a pipe. New
+  `password_hash_async()` / `password_verify_async()` (callback on the loop thread; the password is copied
+  and wiped; salts are drawn on the loop thread so workers take no locks and never malloc), and
+  `password_needs_rehash()` for rehash-on-login. The sync `password_hash` / `password_verify` stay for tools
+  and tests. Linking now needs `-pthread` (the Makefile and the pkg-config / CMake files pass it).
+- **Default PBKDF2-SHA256 iterations: 600 000** (OWASP), up from 150 000 (`PASSWORD_ITERS`;
+  `PASSWORD_ITERS_LEGACY` = 150 000). The count is part of the stored string, so existing hashes verify
+  unchanged; `password_needs_rehash()` reports them.
+- HTTP: **deferred responses.** `http_defer()` in a handler, then `http_deferred_response()` /
+  `http_deferred_finish()` on the loop thread later (e.g. from a pool completion). Pipelined requests on
+  the connection wait (answers stay in order), the idle timeout pauses, a graceful drain waits for it; a
+  finish while changes are pending is held behind the durability barrier like any response; a finish after
+  the client left is dropped (`deferred_orphaned`). New `http_response.deferred`, `http_conn.pending`.
+- HTTP: `http_server_watch()` / `http_server_unwatch()`: extra descriptors on the server's poller (kqueue,
+  epoll and poll), with a callback on the loop thread.
+- `secure_zero()`; PBKDF2 wipes its HMAC state and no longer allocates for salts up to 256 bytes.
+- Fork safety: background compaction forks from the loop thread; its child only serializes the snapshot
+  and writes it (malloc, write, fsync, rename) and never touches the pool; workers hold no libc or modx
+  lock while they compute, so they cannot leave one locked in the child. A test forks compactions while
+  four workers hash.
+- `make test-tsan`: the unit tests under ThreadSanitizer (pool, async hashing, the new in-process socket
+  tests in `tests/test_net.c`).
 - Store: **snapshot checksum.** Snapshots start with `{"crc32":"<hex8>",` (CRC-32 of every byte after that
   prefix); a mismatch fails the open (salvage loads it if it still parses). The file is still plain JSON, so
   0.2 readers open it; snapshots without the key (0.1 / 0.2) are read without the check. The journal

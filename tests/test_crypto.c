@@ -133,11 +133,24 @@ static void t_password(void) {
     CHECK(!password_verify("x", "plain"));
     CHECK(!password_verify("x", "pbkdf2_sha256$abc$00$00"));
     CHECK(!password_verify("x", "pbkdf2_sha256$1$zz$00"));
-    /* the default cost is the contract's */
+    /* the default cost is the contract's (OWASP: 600 000) */
     char *def = password_hash("example-passphrase");
-    CHECK(def && strncmp(def, "pbkdf2_sha256$150000$", 21) == 0);
+    CHECK(def && strncmp(def, "pbkdf2_sha256$600000$", 21) == 0);
     CHECK(password_verify("example-passphrase", def));
+    CHECK(!password_needs_rehash(def, 0));
     free(def);
+    /* a hash written by 0.2 (150 000 iterations; independent vector from Python's hashlib) still verifies,
+     * and asks to be replaced */
+    static const char legacy[] = "pbkdf2_sha256$150000$00112233445566778899aabbccddeeff$"
+                                 "84e7a3c27dd0f63de8aed6d127ff943241081376c3682b2f5693866db0fa455b";
+    CHECK(password_verify("legacy pass", legacy));
+    CHECK(!password_verify("legacy pasS", legacy));
+    CHECK(password_needs_rehash(legacy, 0) && password_needs_rehash(legacy, PASSWORD_ITERS));
+    CHECK(!password_needs_rehash(legacy, PASSWORD_ITERS_LEGACY));
+    CHECK(password_needs_rehash("plain", 0) && password_needs_rehash(NULL, 0));
+    unsigned char z[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+    secure_zero(z, sizeof z);
+    CHECK(z[0] == 0 && z[7] == 0);
 }
 
 static void t_misc(void) {

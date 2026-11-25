@@ -1,4 +1,5 @@
 #include "modx/crypto.h"
+#include "modx/pool.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -135,7 +136,10 @@ void pbkdf2_sha256(const void *pw, size_t pwlen, const void *salt, size_t saltle
                    unsigned char *out, size_t outlen) {
     sha256_ctx in, ou;
     hmac_setup(pw, pwlen, &in, &ou);
-    unsigned char *sb = xmalloc(saltlen + 4);
+    /* no malloc for ordinary salts: worker threads computing this must hold no libc lock
+     * (the loop thread may fork for a background compaction) */
+    unsigned char sbuf_local[256 + 4];
+    unsigned char *sb = saltlen <= 256 ? sbuf_local : xmalloc(saltlen + 4);
     if (saltlen) memcpy(sb, salt, saltlen);
     for (uint32_t block = 1; outlen; block++) {
         sb[saltlen] = (unsigned char)(block >> 24);
@@ -154,7 +158,9 @@ void pbkdf2_sha256(const void *pw, size_t pwlen, const void *salt, size_t saltle
         out += take;
         outlen -= take;
     }
-    free(sb);
+    if (sb != sbuf_local) free(sb);
+    secure_zero(&in, sizeof in);
+    secure_zero(&ou, sizeof ou);
 }
 
 int crypto_random(void *buf, size_t len) {
@@ -219,38 +225,159 @@ long hex_decode(const char *in, unsigned char *out, size_t outcap) {
     return (long)(n / 2);
 }
 
+void secure_zero(void *p, size_t len) {
+    volatile unsigned char *v = p;
+    while (len--) *v++ = 0;
+}
+
+static void format_hash(char *out, size_t cap, uint32_t iters, const unsigned char *salt, size_t saltlen,
+                        const unsigned char *dk) {
+    char sh[2 * 64 + 1], dh[2 * SHA256_LEN + 1];
+    hex_encode(salt, saltlen, sh);
+    hex_encode(dk, SHA256_LEN, dh);
+    snprintf(out, cap, "pbkdf2_sha256$%u$%s$%s", iters, sh, dh);
+}
+
+#define HASH_STR_CAP (32 + 2 * 64 + 2 * SHA256_LEN + 1)
+
 char *password_hash_iters(const char *password, uint32_t iters) {
     unsigned char salt[PASSWORD_SALT_LEN], dk[SHA256_LEN];
     if (crypto_random(salt, sizeof salt) != 0) return NULL;
     pbkdf2_sha256(password, strlen(password), salt, sizeof salt, iters, dk, sizeof dk);
-    char sh[2 * PASSWORD_SALT_LEN + 1], dh[2 * SHA256_LEN + 1];
-    hex_encode(salt, sizeof salt, sh);
-    hex_encode(dk, sizeof dk, dh);
-    char *out = xmalloc(32 + sizeof sh + sizeof dh);
-    snprintf(out, 32 + sizeof sh + sizeof dh, "pbkdf2_sha256$%u$%s$%s", iters, sh, dh);
+    char *out = xmalloc(HASH_STR_CAP);
+    format_hash(out, HASH_STR_CAP, iters, salt, sizeof salt, dk);
+    secure_zero(dk, sizeof dk);
     return out;
 }
 
 char *password_hash(const char *password) { return password_hash_iters(password, PASSWORD_ITERS); }
 
-int password_verify(const char *password, const char *stored) {
-    if (!stored || strncmp(stored, "pbkdf2_sha256$", 14) != 0) return 0;
+/* Splits "pbkdf2_sha256$<iters>$<salt hex>$<hash hex>". 0 = valid. */
+static int parse_hash(const char *stored, uint32_t *iters_out, unsigned char *salt, long *saltlen,
+                      unsigned char want[SHA256_LEN]) {
+    if (!stored || strncmp(stored, "pbkdf2_sha256$", 14) != 0) return -1;
     const char *p = stored + 14;
     char *end;
     errno = 0;
     unsigned long iters = strtoul(p, &end, 10);
-    if (errno || end == p || *end != '$' || iters < 1 || iters > 10000000) return 0;
+    if (errno || end == p || *end != '$' || iters < 1 || iters > 10000000) return -1;
     const char *salt_hex = end + 1;
     const char *dollar = strchr(salt_hex, '$');
-    if (!dollar || dollar - salt_hex > 2 * 64) return 0;
+    if (!dollar || dollar - salt_hex > 2 * 64) return -1;
     char sh[129];
     memcpy(sh, salt_hex, (size_t)(dollar - salt_hex));
     sh[dollar - salt_hex] = 0;
+    long sl = hex_decode(sh, salt, 64);
+    if (sl < 1 || hex_decode(dollar + 1, want, SHA256_LEN) != SHA256_LEN) return -1;
+    *iters_out = (uint32_t)iters;
+    *saltlen = sl;
+    return 0;
+}
+
+int password_verify(const char *password, const char *stored) {
+    uint32_t iters;
+    long sl;
     unsigned char salt[64], want[SHA256_LEN], got[SHA256_LEN];
-    long sl = hex_decode(sh, salt, sizeof salt);
-    if (sl < 1 || hex_decode(dollar + 1, want, sizeof want) != SHA256_LEN) return 0;
-    pbkdf2_sha256(password, strlen(password), salt, (size_t)sl, (uint32_t)iters, got, sizeof got);
-    return ct_equal(got, want, SHA256_LEN);
+    if (parse_hash(stored, &iters, salt, &sl, want) != 0) return 0;
+    pbkdf2_sha256(password, strlen(password), salt, (size_t)sl, iters, got, sizeof got);
+    int ok = ct_equal(got, want, SHA256_LEN);
+    secure_zero(got, sizeof got);
+    return ok;
+}
+
+int password_needs_rehash(const char *stored, uint32_t min_iters) {
+    uint32_t iters;
+    long sl;
+    unsigned char salt[64], want[SHA256_LEN];
+    if (parse_hash(stored, &iters, salt, &sl, want) != 0) return 1;
+    return iters < (min_iters ? min_iters : PASSWORD_ITERS);
+}
+
+/* ---------------- asynchronous hashing (worker pool) ----------------
+ * Everything a job needs is prepared on the calling (loop) thread: the
+ * password copy, the salt (crypto_random may take a lock, e.g. arc4random),
+ * the expected digest. The worker only computes PBKDF2 into the job's own
+ * buffers: no malloc, no locks, nothing shared. */
+
+typedef struct {
+    char *pw;
+    size_t pwlen;
+    unsigned char salt[64];
+    size_t saltlen;
+    uint32_t iters;
+    unsigned char want[SHA256_LEN], got[SHA256_LEN];
+    int verify, skip;
+    password_hash_cb hash_cb;
+    password_verify_cb verify_cb;
+    void *ctx;
+} pw_job;
+
+static void pw_work(void *arg) {
+    pw_job *j = arg;
+    if (j->skip) return;
+    pbkdf2_sha256(j->pw, j->pwlen, j->salt, j->saltlen, j->iters, j->got, sizeof j->got);
+}
+
+static void pw_job_free(pw_job *j) {
+    secure_zero(j->pw, j->pwlen);
+    free(j->pw);
+    secure_zero(j, sizeof *j);
+    free(j);
+}
+
+static void pw_done(void *arg) {
+    pw_job *j = arg;
+    if (j->verify) {
+        int ok = !j->skip && ct_equal(j->got, j->want, SHA256_LEN);
+        int rehash = ok && j->iters < PASSWORD_ITERS;
+        password_verify_cb cb = j->verify_cb;
+        void *ctx = j->ctx;
+        pw_job_free(j);
+        cb(ctx, ok, rehash);
+    } else {
+        char *out = xmalloc(HASH_STR_CAP);
+        format_hash(out, HASH_STR_CAP, j->iters, j->salt, j->saltlen, j->got);
+        password_hash_cb cb = j->hash_cb;
+        void *ctx = j->ctx;
+        pw_job_free(j);
+        cb(ctx, out);
+    }
+}
+
+static pw_job *pw_job_new(const char *password, void *ctx) {
+    pw_job *j = xcalloc(1, sizeof *j);
+    j->pwlen = strlen(password);
+    j->pw = xmalloc(j->pwlen + 1);
+    memcpy(j->pw, password, j->pwlen + 1);
+    j->ctx = ctx;
+    return j;
+}
+
+static int pw_submit(mx_pool *pool, pw_job *j) {
+    if (mx_pool_submit(pool, pw_work, pw_done, j) == 0) return 0;
+    int e = errno;
+    pw_job_free(j);
+    errno = e;
+    return -1;
+}
+
+int password_hash_async(mx_pool *pool, const char *password, uint32_t iters, password_hash_cb cb, void *ctx) {
+    pw_job *j = pw_job_new(password, ctx);
+    j->iters = iters ? iters : PASSWORD_ITERS;
+    j->saltlen = PASSWORD_SALT_LEN;
+    j->hash_cb = cb;
+    if (crypto_random(j->salt, j->saltlen) != 0) { pw_job_free(j); errno = EIO; return -1; }
+    return pw_submit(pool, j);
+}
+
+int password_verify_async(mx_pool *pool, const char *password, const char *stored, password_verify_cb cb, void *ctx) {
+    pw_job *j = pw_job_new(password, ctx);
+    j->verify = 1;
+    j->verify_cb = cb;
+    long sl = 0;
+    if (parse_hash(stored, &j->iters, j->salt, &sl, j->want) != 0) j->skip = 1;
+    j->saltlen = (size_t)sl;
+    return pw_submit(pool, j);
 }
 
 /* ---------------- SHA-1 (only for the WebSocket handshake, RFC 6455) ---------------- */
